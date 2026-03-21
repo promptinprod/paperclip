@@ -87,6 +87,7 @@ describe("evaluateManagedMemoryAudit", () => {
       evaluateManagedMemoryAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         changedFiles: ["memory/2026-03-21.md"],
       }),
@@ -103,6 +104,7 @@ describe("evaluateManagedMemoryAudit", () => {
       evaluateManagedMemoryAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         changedFiles: [],
       }),
@@ -119,6 +121,7 @@ describe("evaluateManagedMemoryAudit", () => {
       evaluateManagedMemoryAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "in_progress",
         changedFiles: [],
       }),
@@ -135,12 +138,30 @@ describe("evaluateManagedMemoryAudit", () => {
       evaluateManagedMemoryAudit({
         supportsManagedMemory: false,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         changedFiles: ["memory/2026-03-21.md"],
       }),
     ).toEqual({
       status: "skipped",
       reason: "unsupported_adapter",
+      issueStatus: "done",
+      changedFiles: [],
+    });
+  });
+
+  it("returns skipped when managed memory requires a project but none is present", () => {
+    expect(
+      evaluateManagedMemoryAudit({
+        supportsManagedMemory: true,
+        outcome: "succeeded",
+        projectId: null,
+        issueStatus: "done",
+        changedFiles: [],
+      }),
+    ).toEqual({
+      status: "skipped",
+      reason: "project_required",
       issueStatus: "done",
       changedFiles: [],
     });
@@ -224,7 +245,12 @@ describe("detectManagedMemoryRecallFromRunLog", () => {
       }),
     ].join("\n");
 
-    expect(detectManagedMemoryRecallFromRunLog(log, ["agent-cfo", "agent-cpo-2"])).toEqual({
+    expect(
+      detectManagedMemoryRecallFromRunLog(log, {
+        ownCollection: "agent-cfo",
+        expectedChildCollections: ["agent-cpo-2"],
+      }),
+    ).toEqual({
       searchedCollections: ["agent-cfo"],
       fetchedCollections: ["agent-cfo"],
       hitCollections: ["agent-cfo"],
@@ -275,10 +301,85 @@ describe("detectManagedMemoryRecallFromRunLog", () => {
       }),
     ].join("\n");
 
-    expect(detectManagedMemoryRecallFromRunLog(log, ["agent-ceo", "agent-cfo"])).toEqual({
+    expect(
+      detectManagedMemoryRecallFromRunLog(log, {
+        ownCollection: "agent-ceo",
+        expectedChildCollections: ["agent-cfo"],
+      }),
+    ).toEqual({
       searchedCollections: ["agent-ceo", "agent-cfo"],
       fetchedCollections: ["agent-ceo", "agent-cfo"],
       hitCollections: ["agent-ceo", "agent-cfo"],
+    });
+  });
+
+  it("treats env-var based collection commands as project-scoped recall activity", () => {
+    const log = [
+      JSON.stringify({
+        ts: "2026-03-21T00:00:00.000Z",
+        stream: "stdout",
+        chunk: JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                name: "Bash",
+                input: {
+                  command:
+                    'qmd query "$BRIEF" --collection "$PAPERCLIP_MEMORY_COLLECTION"\nfor c in $(echo "$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON"); do qmd search "$BRIEF" --collection "$c"; done',
+                },
+              },
+            ],
+          },
+        }),
+      }),
+      JSON.stringify({
+        ts: "2026-03-21T00:00:01.000Z",
+        stream: "stdout",
+        chunk: JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                name: "Bash",
+                input: {
+                  command:
+                    'qmd get "qmd://$PAPERCLIP_MEMORY_COLLECTION/memory/2026-03-21.md"\nfor c in $(echo "$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON"); do qmd get "qmd://$c/life/projects/checkmymanuscript/summary.md"; done',
+                },
+              },
+            ],
+          },
+        }),
+      }),
+      JSON.stringify({
+        ts: "2026-03-21T00:00:02.000Z",
+        stream: "stdout",
+        chunk: JSON.stringify({
+          type: "user",
+          message: {
+            content: [
+              {
+                type: "tool_result",
+                content:
+                  "qmd://agent-ceo-project-project-1/memory/2026-03-21.md\nqmd://agent-cfo-project-project-1/life/projects/checkmymanuscript/summary.md",
+              },
+            ],
+          },
+        }),
+      }),
+    ].join("\n");
+
+    expect(
+      detectManagedMemoryRecallFromRunLog(log, {
+        ownCollection: "agent-ceo-project-project-1",
+        expectedChildCollections: ["agent-cfo-project-project-1"],
+      }),
+    ).toEqual({
+      searchedCollections: ["agent-ceo-project-project-1", "agent-cfo-project-project-1"],
+      fetchedCollections: ["agent-ceo-project-project-1", "agent-cfo-project-project-1"],
+      hitCollections: ["agent-ceo-project-project-1", "agent-cfo-project-project-1"],
     });
   });
 });
@@ -289,6 +390,7 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       evaluateManagedMemoryRecallAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         hasIssue: true,
         ownCollection: "agent-ceo",
@@ -318,6 +420,7 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       evaluateManagedMemoryRecallAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         hasIssue: true,
         ownCollection: "agent-ceo",
@@ -347,6 +450,7 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       evaluateManagedMemoryRecallAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         hasIssue: true,
         ownCollection: "agent-cfo",
@@ -376,6 +480,7 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       evaluateManagedMemoryRecallAudit({
         supportsManagedMemory: true,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         hasIssue: true,
         ownCollection: "agent-cfo",
@@ -405,6 +510,7 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       evaluateManagedMemoryRecallAudit({
         supportsManagedMemory: false,
         outcome: "succeeded",
+        projectId: "project-1",
         issueStatus: "done",
         hasIssue: true,
         ownCollection: "agent-cfo",
@@ -421,6 +527,36 @@ describe("evaluateManagedMemoryRecallAudit", () => {
       issueStatus: "done",
       ownCollection: "agent-cfo",
       expectedChildCollections: ["agent-cpo-2"],
+      searchedCollections: [],
+      fetchedCollections: [],
+      hitCollections: [],
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    });
+  });
+
+  it("returns skipped when managed memory requires a project but none is present", () => {
+    expect(
+      evaluateManagedMemoryRecallAudit({
+        supportsManagedMemory: true,
+        outcome: "succeeded",
+        projectId: null,
+        issueStatus: "done",
+        hasIssue: true,
+        ownCollection: null,
+        expectedChildCollections: [],
+        recallDetection: {
+          searchedCollections: [],
+          fetchedCollections: [],
+          hitCollections: [],
+        },
+      }),
+    ).toEqual({
+      status: "skipped",
+      reason: "project_required",
+      issueStatus: "done",
+      ownCollection: null,
+      expectedChildCollections: [],
       searchedCollections: [],
       fetchedCollections: [],
       hitCollections: [],

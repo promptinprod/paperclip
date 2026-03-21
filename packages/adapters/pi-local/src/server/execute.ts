@@ -126,7 +126,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "");
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
+  const workspaceProjectId = asString(workspaceContext.projectId, "");
+  const workspaceProjectName = asString(workspaceContext.projectName, "");
   const agentHome = asString(workspaceContext.agentHome, "");
+  const memoryCollection = asString(workspaceContext.memoryCollection, "");
+  const directReportMemoryCollections = Array.isArray(workspaceContext.directReportMemoryCollections)
+    ? workspaceContext.directReportMemoryCollections.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
@@ -188,7 +196,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (workspaceId) env.PAPERCLIP_WORKSPACE_ID = workspaceId;
   if (workspaceRepoUrl) env.PAPERCLIP_WORKSPACE_REPO_URL = workspaceRepoUrl;
   if (workspaceRepoRef) env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
+  if (workspaceProjectId) env.PAPERCLIP_PROJECT_ID = workspaceProjectId;
+  if (workspaceProjectName) env.PAPERCLIP_PROJECT_NAME = workspaceProjectName;
   if (agentHome) env.AGENT_HOME = agentHome;
+  if (memoryCollection) env.PAPERCLIP_MEMORY_COLLECTION = memoryCollection;
+  if (directReportMemoryCollections.length > 0) {
+    env.PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON = JSON.stringify(directReportMemoryCollections);
+  }
   if (workspaceHints.length > 0) env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
 
   for (const [key, value] of Object.entries(envConfig)) {
