@@ -2,11 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { deriveAgentUrlKey } from "@paperclipai/shared";
 import {
-  buildManagedAgentCollectionName,
-  initManagedAgentQmdCollection,
   SUPPORTED_MANAGED_AGENT_MEMORY_ADAPTER_TYPES,
   supportsManagedAgentMemoryAdapter,
 } from "./managed-agent-memory.js";
@@ -60,25 +58,12 @@ function deriveRelativePath(
   return relativePath.length > 0 && !relativePath.startsWith("..") ? relativePath : absolutePath;
 }
 
-function buildCollectionName(slug: string): string {
-  return buildManagedAgentCollectionName(slug);
-}
-
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n/g, "\n");
-}
-
-function renderChildCollectionsLine(childCollections: string[]): string {
-  if (childCollections.length === 0) {
-    return "- Direct-report collections you may read and update: none.";
-  }
-  return `- Direct-report collections you may read and update: ${childCollections
-    .map((collection) => `\`${collection}\``)
-    .join(", ")}`;
 }
 
 function upsertManagedMemoryBlock(existingContent: string, managedBlock: string): {
@@ -184,10 +169,8 @@ export interface RenderInstructionsInput {
 }
 
 export function renderManagedMemoryBlock(input: RenderInstructionsInput): string {
-  const ownCollection = buildCollectionName(input.slug);
-  const childCollections = Array.from(new Set(input.childCollections ?? [])).sort();
   const parentLine = input.parentName
-    ? `- Your direct manager (${input.parentName}) may read and update your collection.`
+    ? `- Your direct manager (${input.parentName}) may read and update the current project's collection when they are working on the same project.`
     : "- You have no direct manager configured.";
 
   return `${MANAGED_MEMORY_BEGIN_MARKER}
@@ -197,17 +180,18 @@ You MUST use the \`para-memory-files\` skill for all memory operations: storing 
 
 Invoke it whenever you need to remember, retrieve, or organize anything.
 
-Your memory is stored under \`$AGENT_HOME\` and indexed in QMD collection \`${ownCollection}\`.
+Managed local memory is project-scoped. For project-backed runs, Paperclip sets \`$AGENT_HOME\` to the current project's memory root and injects the active QMD collection name in \`$PAPERCLIP_MEMORY_COLLECTION\`.
 
 ### Memory workflow
 
 - After loading issue context for a task, build a compact recall brief from the issue title, description, goal, project, ancestor titles, and wake comment if present.
-- Search your own QMD collection with that recall brief before doing domain work.
-- If you manage direct reports, search each direct-report collection you are allowed to access with the same recall brief.
+- Search the current project's QMD collection with that recall brief before doing domain work.
+- If you manage direct reports, search each same-project direct-report collection listed in \`$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON\`.
 - If a search returns relevant hits, load at least one relevant item with \`qmd get\`, \`qmd multi-get\`, or the equivalent QMD MCP fetch tool before proceeding.
 - Write meaningful task progress and outcomes to \`$AGENT_HOME/memory/YYYY-MM-DD.md\`.
 - Extract durable facts, decisions, and references to the relevant files under \`$AGENT_HOME/life/\`.
 - Update \`AGENTS.md\`, \`TOOLS.md\`, or the relevant skill file when you learn a durable operating lesson.
+- Runs without a project do not participate in managed QMD memory. Assign the work to a project before relying on managed recall or managed writes.
 
 ### Completion rule
 
@@ -215,24 +199,24 @@ Before considering a task complete, write the outcome to memory:
 
 - Append progress and outcomes to \`$AGENT_HOME/memory/YYYY-MM-DD.md\`.
 - Extract durable facts and decisions to the relevant files under \`$AGENT_HOME/life/\`.
-- Verify the memory is discoverable with \`qmd query ... --collection ${ownCollection}\` or \`qmd search ... --collection ${ownCollection}\`.
+- Verify the memory is discoverable with \`qmd query ... --collection "$PAPERCLIP_MEMORY_COLLECTION"\` or \`qmd search ... --collection "$PAPERCLIP_MEMORY_COLLECTION"\`.
 
 Paperclip tries to create this collection automatically. If it is missing, create it with:
 \`\`\`bash
-qmd collection add $AGENT_HOME --name ${ownCollection}
+qmd collection add $AGENT_HOME --name "$PAPERCLIP_MEMORY_COLLECTION"
 \`\`\`
 
 Use memory with:
 \`\`\`bash
-qmd query "search terms" --collection ${ownCollection}
-qmd search "exact phrase" --collection ${ownCollection}
+qmd query "search terms" --collection "$PAPERCLIP_MEMORY_COLLECTION"
+qmd search "exact phrase" --collection "$PAPERCLIP_MEMORY_COLLECTION"
 \`\`\`
 
 ### Collection access
 
-- Your own collection: \`${ownCollection}\`
+- Your current project collection: \`$PAPERCLIP_MEMORY_COLLECTION\`
 ${parentLine}
-${renderChildCollectionsLine(childCollections)}
+- Same-project direct-report collections you may read and update are provided at runtime in \`$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON\`.
 ${MANAGED_MEMORY_END_MARKER}`;
 }
 
@@ -364,31 +348,6 @@ async function getAgentInstructionsRow(
   };
 }
 
-async function listManagedDirectReportCollections(
-  db: Db,
-  managerId: string,
-): Promise<string[]> {
-  const rows = await db
-    .select({
-      name: agents.name,
-      adapterType: agents.adapterType,
-      adapterConfig: agents.adapterConfig,
-    })
-    .from(agents)
-    .where(and(eq(agents.reportsTo, managerId), ne(agents.status, "terminated")));
-
-  return rows
-    .filter((row) => {
-      const adapterConfig =
-        typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
-          ? (row.adapterConfig as Record<string, unknown>)
-          : {};
-      return shouldAutoGenerateInstructions(row.adapterType, adapterConfig);
-    })
-    .map((row) => buildCollectionName(deriveAgentUrlKey(row.name)))
-    .sort();
-}
-
 export interface SyncManagedInstructionsResult {
   agentId: string;
   absolutePath: string | null;
@@ -446,7 +405,6 @@ export async function syncManagedInstructionsForAgent(
       )?.name ?? null
     : null;
 
-  const childCollections = await listManagedDirectReportCollections(db, row.id);
   const result = await generateInstructionsFile({
     absolutePath: target.absolutePath,
     relativePath: target.relativePath,
@@ -455,7 +413,6 @@ export async function syncManagedInstructionsForAgent(
     title: row.title,
     capabilities: row.capabilities,
     parentName,
-    childCollections,
     slug,
   });
 
@@ -485,7 +442,6 @@ export async function syncManagedInstructionsForAgent(
     configPersisted = true;
   }
 
-  const collectionEnsured = await initQmdCollection(row.id, slug);
   return {
     agentId: row.id,
     absolutePath: result.absolutePath,
@@ -493,7 +449,7 @@ export async function syncManagedInstructionsForAgent(
     created: result.created,
     updated: result.updated,
     configPersisted,
-    collectionEnsured,
+    collectionEnsured: false,
     skipped: false,
     reason: null,
   };
@@ -522,5 +478,7 @@ export async function backfillAgentInstructions(db: Db): Promise<{ backfilled: n
 }
 
 export async function initQmdCollection(agentId: string, slug: string): Promise<boolean> {
-  return initManagedAgentQmdCollection(agentId, slug);
+  void agentId;
+  void slug;
+  return false;
 }

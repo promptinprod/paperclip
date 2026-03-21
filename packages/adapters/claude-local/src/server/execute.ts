@@ -122,7 +122,15 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const workspaceRepoRef = asString(workspaceContext.repoRef, "") || null;
   const workspaceBranch = asString(workspaceContext.branchName, "") || null;
   const workspaceWorktreePath = asString(workspaceContext.worktreePath, "") || null;
+  const workspaceProjectId = asString(workspaceContext.projectId, "") || null;
+  const workspaceProjectName = asString(workspaceContext.projectName, "") || null;
   const agentHome = asString(workspaceContext.agentHome, "") || null;
+  const memoryCollection = asString(workspaceContext.memoryCollection, "") || null;
+  const directReportMemoryCollections = Array.isArray(workspaceContext.directReportMemoryCollections)
+    ? workspaceContext.directReportMemoryCollections.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
@@ -217,8 +225,20 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   if (workspaceWorktreePath) {
     env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspaceWorktreePath;
   }
+  if (workspaceProjectId) {
+    env.PAPERCLIP_PROJECT_ID = workspaceProjectId;
+  }
+  if (workspaceProjectName) {
+    env.PAPERCLIP_PROJECT_NAME = workspaceProjectName;
+  }
   if (agentHome) {
     env.AGENT_HOME = agentHome;
+  }
+  if (memoryCollection) {
+    env.PAPERCLIP_MEMORY_COLLECTION = memoryCollection;
+  }
+  if (directReportMemoryCollections.length > 0) {
+    env.PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON = JSON.stringify(directReportMemoryCollections);
   }
   if (workspaceHints.length > 0) {
     env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
