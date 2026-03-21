@@ -2,14 +2,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
+import { deriveAgentUrlKey, type BillingType, type ExecutionWorkspace, type ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  goals,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -58,6 +59,11 @@ import {
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import {
+  buildManagedAgentCollectionName,
+  refreshManagedAgentQmdCollection,
+  supportsManagedAgentMemoryAdapter,
+} from "./managed-agent-memory.js";
+import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
@@ -76,7 +82,12 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const MANAGED_MEMORY_RECALL_BRIEF_MAX_CHARS = 600;
+const RUN_LOG_READ_CHUNK_BYTES = 256_000;
+const RUN_LOG_READ_MAX_BYTES = 4 * 1024 * 1024;
 const execFile = promisify(execFileCallback);
+const MANAGED_MEMORY_RELATIVE_DIRS = ["memory", "life"] as const;
+const MANAGED_MEMORY_TOP_LEVEL_FILES = ["MEMORY.md"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -195,6 +206,577 @@ function buildExecutionWorkspaceConfigSnapshot(config: Record<string, unknown>):
     return true;
   });
   return hasSnapshot ? snapshot : null;
+}
+
+type ManagedMemoryFileMetadata = {
+  size: number;
+  mtimeMs: number;
+};
+
+export type ManagedMemorySnapshot = Record<string, ManagedMemoryFileMetadata>;
+
+export type ManagedMemoryAuditReason =
+  | "unsupported_adapter"
+  | "run_not_succeeded"
+  | "no_issue"
+  | "issue_not_done"
+  | "completed_without_memory"
+  | "audit_error"
+  | null;
+
+export type ManagedMemoryAudit = {
+  status: "written" | "missing" | "skipped";
+  reason: ManagedMemoryAuditReason;
+  issueStatus: string | null;
+  changedFiles: string[];
+};
+
+export interface IssueAlignedMemorySearchBriefInput {
+  issueIdentifier?: string | null;
+  issueTitle?: string | null;
+  issueDescription?: string | null;
+  goalTitle?: string | null;
+  projectName?: string | null;
+  ancestorTitles?: string[] | null;
+  wakeCommentBody?: string | null;
+}
+
+export interface ManagedMemoryRecallDetection {
+  searchedCollections: string[];
+  fetchedCollections: string[];
+  hitCollections: string[];
+}
+
+export type ManagedMemoryRecallAuditReason =
+  | "unsupported_adapter"
+  | "run_not_succeeded"
+  | "no_issue"
+  | "log_unavailable"
+  | "audit_error"
+  | "own_collection_not_searched"
+  | "child_collections_not_searched"
+  | "search_hits_not_fetched"
+  | null;
+
+export type ManagedMemoryRecallAudit = {
+  status: "loaded" | "partial" | "missing" | "skipped";
+  reason: ManagedMemoryRecallAuditReason;
+  issueStatus: string | null;
+  ownCollection: string | null;
+  expectedChildCollections: string[];
+  searchedCollections: string[];
+  fetchedCollections: string[];
+  hitCollections: string[];
+  missingCollections: string[];
+  unfetchedHitCollections: string[];
+};
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return Array.from(new Set(values)).sort();
+}
+
+export function buildIssueAlignedMemorySearchBrief(
+  input: IssueAlignedMemorySearchBriefInput,
+): string | null {
+  const segments: string[] = [];
+  const issueTitle = collapseWhitespace(input.issueTitle ?? "");
+  const issueIdentifier = collapseWhitespace(input.issueIdentifier ?? "");
+  const issueDescription = collapseWhitespace(input.issueDescription ?? "");
+  const goalTitle = collapseWhitespace(input.goalTitle ?? "");
+  const projectName = collapseWhitespace(input.projectName ?? "");
+  const ancestorTitles = Array.from(
+    new Set((input.ancestorTitles ?? []).map((value) => collapseWhitespace(value)).filter(Boolean)),
+  );
+  const wakeCommentBody = collapseWhitespace(input.wakeCommentBody ?? "");
+
+  if (issueTitle) {
+    segments.push(issueIdentifier ? `${issueIdentifier}: ${issueTitle}` : issueTitle);
+  } else if (issueIdentifier) {
+    segments.push(issueIdentifier);
+  }
+  if (issueDescription) segments.push(`Issue: ${truncateText(issueDescription, 180)}`);
+  if (goalTitle) segments.push(`Goal: ${goalTitle}`);
+  if (projectName) segments.push(`Project: ${projectName}`);
+  if (ancestorTitles.length > 0) segments.push(`Ancestors: ${ancestorTitles.join(" > ")}`);
+  if (wakeCommentBody) segments.push(`Wake comment: ${truncateText(wakeCommentBody, 160)}`);
+
+  if (segments.length === 0) return null;
+  return truncateText(segments.join(" | "), MANAGED_MEMORY_RECALL_BRIEF_MAX_CHARS);
+}
+
+function parseRunLogChunks(logContent: string): Array<{ chunkText: string; inner: Record<string, unknown> | null }> {
+  const chunks: Array<{ chunkText: string; inner: Record<string, unknown> | null }> = [];
+  for (const line of logContent.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    try {
+      const outer = JSON.parse(trimmed) as { chunk?: unknown };
+      const chunkText = typeof outer.chunk === "string" ? outer.chunk : "";
+      if (chunkText.length === 0) continue;
+
+      let inner: Record<string, unknown> | null = null;
+      try {
+        const parsedInner = JSON.parse(chunkText);
+        if (parsedInner && typeof parsedInner === "object" && !Array.isArray(parsedInner)) {
+          inner = parsedInner as Record<string, unknown>;
+        }
+      } catch {
+        inner = null;
+      }
+
+      chunks.push({ chunkText, inner });
+    } catch {
+      continue;
+    }
+  }
+  return chunks;
+}
+
+function detectCliRecallCollections(
+  command: string,
+  targetCollections: Set<string>,
+  subcommands: readonly string[],
+): string[] {
+  const found = new Set<string>();
+  for (const collection of targetCollections) {
+    const pattern = new RegExp(
+      `(?:^|\\s)qmd\\s+(?:${subcommands.join("|")})\\b[\\s\\S]*?(?:--collection|-c)\\s+["']?${escapeRegex(collection)}(?:["']|\\b)`,
+      "i",
+    );
+    if (pattern.test(command)) found.add(collection);
+  }
+  return uniqueSorted(found);
+}
+
+function detectCliFetchCollections(command: string, targetCollections: Set<string>): string[] {
+  const found = new Set<string>();
+  for (const collection of targetCollections) {
+    const pattern = new RegExp(
+      `(?:^|\\s)qmd\\s+(?:get|multi-get)\\b[\\s\\S]*?qmd://${escapeRegex(collection)}/`,
+      "i",
+    );
+    if (pattern.test(command)) found.add(collection);
+  }
+  return uniqueSorted(found);
+}
+
+function detectCollectionsInStructuredInput(
+  value: unknown,
+  targetCollections: Set<string>,
+): string[] {
+  const serialized = JSON.stringify(value ?? {});
+  const found = new Set<string>();
+  for (const collection of targetCollections) {
+    const collectionPattern = new RegExp(`["']?${escapeRegex(collection)}["']?`, "i");
+    if (collectionPattern.test(serialized) || serialized.includes(`qmd://${collection}/`)) {
+      found.add(collection);
+    }
+  }
+  return uniqueSorted(found);
+}
+
+function extractToolUsesFromChunk(chunk: Record<string, unknown>): Array<{ name: string; input: Record<string, unknown> }> {
+  const message =
+    chunk.type === "assistant" &&
+    chunk.message &&
+    typeof chunk.message === "object" &&
+    !Array.isArray(chunk.message)
+      ? (chunk.message as Record<string, unknown>)
+      : null;
+  const content = Array.isArray(message?.content) ? message.content : [];
+
+  return content
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const record = item as Record<string, unknown>;
+      if (record.type !== "tool_use" || typeof record.name !== "string") return null;
+      const input =
+        record.input && typeof record.input === "object" && !Array.isArray(record.input)
+          ? (record.input as Record<string, unknown>)
+          : {};
+      return { name: record.name, input };
+    })
+    .filter((value): value is { name: string; input: Record<string, unknown> } => value !== null);
+}
+
+export function detectManagedMemoryRecallFromRunLog(
+  logContent: string,
+  targetCollections: string[],
+): ManagedMemoryRecallDetection {
+  const targetSet = new Set(targetCollections.filter(Boolean));
+  const searchedCollections = new Set<string>();
+  const fetchedCollections = new Set<string>();
+  const hitCollections = new Set<string>();
+
+  if (targetSet.size === 0 || logContent.trim().length === 0) {
+    return {
+      searchedCollections: [],
+      fetchedCollections: [],
+      hitCollections: [],
+    };
+  }
+
+  for (const { chunkText, inner } of parseRunLogChunks(logContent)) {
+    if (inner) {
+      for (const toolUse of extractToolUsesFromChunk(inner)) {
+        if (toolUse.name === "Bash") {
+          const command = typeof toolUse.input.command === "string" ? toolUse.input.command : "";
+          for (const collection of detectCliRecallCollections(command, targetSet, ["query", "search"])) {
+            searchedCollections.add(collection);
+          }
+          for (const collection of detectCliFetchCollections(command, targetSet)) {
+            fetchedCollections.add(collection);
+          }
+          continue;
+        }
+
+        if (toolUse.name === "mcp__plugin_qmd_qmd__query") {
+          for (const collection of detectCollectionsInStructuredInput(toolUse.input, targetSet)) {
+            searchedCollections.add(collection);
+          }
+          continue;
+        }
+
+        if (toolUse.name === "mcp__plugin_qmd_qmd__get" || toolUse.name === "mcp__plugin_qmd_qmd__multi_get") {
+          for (const collection of detectCollectionsInStructuredInput(toolUse.input, targetSet)) {
+            fetchedCollections.add(collection);
+          }
+        }
+      }
+    }
+
+    for (const collection of targetSet) {
+      if (chunkText.includes(`qmd://${collection}/`)) {
+        hitCollections.add(collection);
+      }
+    }
+  }
+
+  return {
+    searchedCollections: uniqueSorted(searchedCollections),
+    fetchedCollections: uniqueSorted(fetchedCollections),
+    hitCollections: uniqueSorted(hitCollections),
+  };
+}
+
+export function evaluateManagedMemoryRecallAudit(input: {
+  supportsManagedMemory: boolean;
+  outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  issueStatus: string | null;
+  hasIssue: boolean;
+  ownCollection: string | null;
+  expectedChildCollections: string[];
+  recallDetection: ManagedMemoryRecallDetection;
+}): ManagedMemoryRecallAudit {
+  const ownCollection = input.ownCollection?.trim() || null;
+  const expectedChildCollections = uniqueSorted(input.expectedChildCollections.filter(Boolean));
+  const expectedCollections = uniqueSorted([ownCollection, ...expectedChildCollections].filter((value): value is string => Boolean(value)));
+  const expectedSet = new Set(expectedCollections);
+  const searchedCollections = uniqueSorted(input.recallDetection.searchedCollections.filter((value) => expectedSet.has(value)));
+  const fetchedCollections = uniqueSorted(input.recallDetection.fetchedCollections.filter((value) => expectedSet.has(value)));
+  const hitCollections = uniqueSorted(input.recallDetection.hitCollections.filter((value) => expectedSet.has(value)));
+
+  if (!input.supportsManagedMemory) {
+    return {
+      status: "skipped",
+      reason: "unsupported_adapter",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections: [],
+      fetchedCollections: [],
+      hitCollections: [],
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    };
+  }
+
+  if (input.outcome !== "succeeded") {
+    return {
+      status: "skipped",
+      reason: "run_not_succeeded",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    };
+  }
+
+  if (!input.hasIssue) {
+    return {
+      status: "skipped",
+      reason: "no_issue",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    };
+  }
+
+  const missingCollections: string[] = [];
+  if (ownCollection && !searchedCollections.includes(ownCollection)) {
+    missingCollections.push(ownCollection);
+  }
+  for (const collection of expectedChildCollections) {
+    if (!searchedCollections.includes(collection)) {
+      missingCollections.push(collection);
+    }
+  }
+
+  const unfetchedHitCollections = hitCollections.filter((collection) => !fetchedCollections.includes(collection));
+
+  if (missingCollections.length === 0 && unfetchedHitCollections.length === 0) {
+    return {
+      status: "loaded",
+      reason: null,
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    };
+  }
+
+  if (ownCollection && missingCollections.includes(ownCollection)) {
+    return {
+      status: "missing",
+      reason: "own_collection_not_searched",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections,
+      unfetchedHitCollections,
+    };
+  }
+
+  if (missingCollections.length > 0) {
+    return {
+      status: "partial",
+      reason: "child_collections_not_searched",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections,
+      unfetchedHitCollections,
+    };
+  }
+
+  return {
+    status: "partial",
+    reason: "search_hits_not_fetched",
+    issueStatus: input.issueStatus,
+    ownCollection,
+    expectedChildCollections,
+    searchedCollections,
+    fetchedCollections,
+    hitCollections,
+    missingCollections: [],
+    unfetchedHitCollections,
+  };
+}
+
+function normalizeManagedMemoryRelativePath(agentHome: string, absolutePath: string): string | null {
+  const relativePath = path.relative(agentHome, absolutePath);
+  if (!relativePath || relativePath.startsWith("..")) return null;
+  return relativePath.split(path.sep).join("/");
+}
+
+async function addManagedMemoryFileToSnapshot(
+  agentHome: string,
+  absolutePath: string,
+  snapshot: ManagedMemorySnapshot,
+) {
+  const entry = await fs.stat(absolutePath).catch(() => null);
+  if (!entry?.isFile()) return;
+  const relativePath = normalizeManagedMemoryRelativePath(agentHome, absolutePath);
+  if (!relativePath) return;
+  snapshot[relativePath] = {
+    size: entry.size,
+    mtimeMs: entry.mtimeMs,
+  };
+}
+
+async function collectManagedMemoryDirectory(
+  agentHome: string,
+  absoluteDir: string,
+  snapshot: ManagedMemorySnapshot,
+): Promise<void> {
+  const entries = await fs.readdir(absoluteDir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!entries) return;
+
+  for (const entry of entries) {
+    const absolutePath = path.join(absoluteDir, entry.name);
+    if (entry.isDirectory()) {
+      await collectManagedMemoryDirectory(agentHome, absolutePath, snapshot);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    await addManagedMemoryFileToSnapshot(agentHome, absolutePath, snapshot);
+  }
+}
+
+export async function snapshotManagedMemoryState(agentHome: string): Promise<ManagedMemorySnapshot> {
+  const snapshot: ManagedMemorySnapshot = {};
+
+  for (const filename of MANAGED_MEMORY_TOP_LEVEL_FILES) {
+    await addManagedMemoryFileToSnapshot(agentHome, path.join(agentHome, filename), snapshot);
+  }
+
+  for (const directory of MANAGED_MEMORY_RELATIVE_DIRS) {
+    await collectManagedMemoryDirectory(agentHome, path.join(agentHome, directory), snapshot);
+  }
+
+  return snapshot;
+}
+
+export function diffManagedMemorySnapshots(
+  before: ManagedMemorySnapshot,
+  after: ManagedMemorySnapshot,
+): string[] {
+  const changedFiles: string[] = [];
+
+  for (const [relativePath, next] of Object.entries(after)) {
+    const previous = before[relativePath];
+    if (!previous || previous.size !== next.size || previous.mtimeMs !== next.mtimeMs) {
+      changedFiles.push(relativePath);
+    }
+  }
+
+  return changedFiles.sort();
+}
+
+export function evaluateManagedMemoryAudit(input: {
+  supportsManagedMemory: boolean;
+  outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  issueStatus: string | null;
+  changedFiles: string[];
+}): ManagedMemoryAudit {
+  if (!input.supportsManagedMemory) {
+    return {
+      status: "skipped",
+      reason: "unsupported_adapter",
+      issueStatus: input.issueStatus,
+      changedFiles: [],
+    };
+  }
+
+  if (input.outcome !== "succeeded") {
+    return {
+      status: "skipped",
+      reason: "run_not_succeeded",
+      issueStatus: input.issueStatus,
+      changedFiles: input.changedFiles,
+    };
+  }
+
+  if (input.changedFiles.length > 0) {
+    return {
+      status: "written",
+      reason: null,
+      issueStatus: input.issueStatus,
+      changedFiles: input.changedFiles,
+    };
+  }
+
+  if (!input.issueStatus) {
+    return {
+      status: "skipped",
+      reason: "no_issue",
+      issueStatus: null,
+      changedFiles: [],
+    };
+  }
+
+  if (input.issueStatus !== "done") {
+    return {
+      status: "skipped",
+      reason: "issue_not_done",
+      issueStatus: input.issueStatus,
+      changedFiles: [],
+    };
+  }
+
+  return {
+    status: "missing",
+    reason: "completed_without_memory",
+    issueStatus: input.issueStatus,
+    changedFiles: [],
+  };
+}
+
+async function readRunLogContent(handle: RunLogHandle): Promise<string> {
+  const runLogStore = getRunLogStore();
+  let offset = 0;
+  let totalBytes = 0;
+  const chunks: string[] = [];
+
+  for (;;) {
+    const result = await runLogStore.read(handle, {
+      offset,
+      limitBytes: RUN_LOG_READ_CHUNK_BYTES,
+    });
+
+    if (!result.content) break;
+    chunks.push(result.content);
+    totalBytes += Buffer.byteLength(result.content, "utf8");
+    if (!result.nextOffset || totalBytes >= RUN_LOG_READ_MAX_BYTES) break;
+    offset = result.nextOffset;
+  }
+
+  return chunks.join("");
+}
+
+async function listManagedDirectReportCollections(
+  db: Db,
+  managerId: string,
+): Promise<string[]> {
+  const rows = await db
+    .select({
+      name: agents.name,
+      adapterType: agents.adapterType,
+    })
+    .from(agents)
+    .where(and(eq(agents.reportsTo, managerId), ne(agents.status, "terminated")));
+
+  return uniqueSorted(
+    rows
+      .filter((row) => supportsManagedAgentMemoryAdapter(row.adapterType))
+      .map((row) => buildManagedAgentCollectionName(deriveAgentUrlKey(row.name))),
+  );
 }
 
 function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
@@ -2315,6 +2897,8 @@ export function heartbeatService(db: Db) {
             title: issues.title,
             status: issues.status,
             priority: issues.priority,
+            description: issues.description,
+            goalId: issues.goalId,
             projectId: issues.projectId,
             projectWorkspaceId: issues.projectWorkspaceId,
             executionWorkspaceId: issues.executionWorkspaceId,
@@ -2906,6 +3490,52 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      const supportsManagedMemory = supportsManagedAgentMemoryAdapter(agent.adapterType);
+      const managedMemoryAgentHome = supportsManagedMemory ? resolveDefaultAgentWorkspaceDir(agent.id) : null;
+      const managedMemorySlug = supportsManagedMemory ? deriveAgentUrlKey(agent.name) : null;
+      const managedMemoryCollectionName =
+        managedMemorySlug ? buildManagedAgentCollectionName(managedMemorySlug) : null;
+      const managedMemoryExpectedChildCollections = supportsManagedMemory
+        ? await listManagedDirectReportCollections(db, agent.id)
+        : [];
+      const managedMemoryRecallBrief =
+        supportsManagedMemory && issueContext
+          ? await (async () => {
+              const wakeCommentId = readNonEmptyString(context.wakeCommentId);
+              const [ancestors, projectRow, goalRow, wakeComment] = await Promise.all([
+                issuesSvc.getAncestors(issueContext.id),
+                issueContext.projectId
+                  ? db
+                      .select({ name: projects.name })
+                      .from(projects)
+                      .where(and(eq(projects.id, issueContext.projectId), eq(projects.companyId, agent.companyId)))
+                      .then((rows) => rows[0] ?? null)
+                  : null,
+                issueContext.goalId
+                  ? db
+                      .select({ title: goals.title })
+                      .from(goals)
+                      .where(and(eq(goals.id, issueContext.goalId), eq(goals.companyId, agent.companyId)))
+                      .then((rows) => rows[0] ?? null)
+                  : null,
+                wakeCommentId ? issuesSvc.getComment(wakeCommentId) : null,
+              ]);
+
+              return buildIssueAlignedMemorySearchBrief({
+                issueIdentifier: issueContext.identifier,
+                issueTitle: issueContext.title,
+                issueDescription: issueContext.description ?? null,
+                goalTitle: goalRow?.title ?? null,
+                projectName: projectRow?.name ?? null,
+                ancestorTitles: ancestors.map((ancestor) => ancestor.title),
+                wakeCommentBody:
+                  wakeComment && wakeComment.issueId === issueContext.id ? wakeComment.body ?? null : null,
+              });
+            })()
+          : null;
+      const managedMemoryBefore = managedMemoryAgentHome
+        ? await snapshotManagedMemoryState(managedMemoryAgentHome)
+        : null;
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -3034,6 +3664,228 @@ export function heartbeatService(db: Db) {
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
+
+      const finalIssueState = issueId
+        ? await db
+            .select({
+              status: issues.status,
+              identifier: issues.identifier,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+            .then((rows) => rows[0] ?? null)
+        : null;
+      let managedMemoryRecallAudit: ManagedMemoryRecallAudit = evaluateManagedMemoryRecallAudit({
+        supportsManagedMemory,
+        outcome,
+        issueStatus: finalIssueState?.status ?? null,
+        hasIssue: Boolean(issueId),
+        ownCollection: managedMemoryCollectionName,
+        expectedChildCollections: managedMemoryExpectedChildCollections,
+        recallDetection: {
+          searchedCollections: [],
+          fetchedCollections: [],
+          hitCollections: [],
+        },
+      });
+      if (supportsManagedMemory) {
+        if (handle) {
+          try {
+            const runLogContent = await readRunLogContent(handle);
+            const recallDetection = detectManagedMemoryRecallFromRunLog(runLogContent, [
+              managedMemoryCollectionName ?? "",
+              ...managedMemoryExpectedChildCollections,
+            ]);
+            managedMemoryRecallAudit = evaluateManagedMemoryRecallAudit({
+              supportsManagedMemory,
+              outcome,
+              issueStatus: finalIssueState?.status ?? null,
+              hasIssue: Boolean(issueId),
+              ownCollection: managedMemoryCollectionName,
+              expectedChildCollections: managedMemoryExpectedChildCollections,
+              recallDetection,
+            });
+          } catch (error) {
+            logger.warn(
+              {
+                companyId: agent.companyId,
+                agentId: agent.id,
+                runId: run.id,
+                issueId,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "failed to audit managed memory recall after heartbeat",
+            );
+            managedMemoryRecallAudit = {
+              status: "skipped",
+              reason: "audit_error",
+              issueStatus: finalIssueState?.status ?? null,
+              ownCollection: managedMemoryCollectionName,
+              expectedChildCollections: managedMemoryExpectedChildCollections,
+              searchedCollections: [],
+              fetchedCollections: [],
+              hitCollections: [],
+              missingCollections: [],
+              unfetchedHitCollections: [],
+            };
+          }
+        } else if (issueId) {
+          managedMemoryRecallAudit = {
+            status: "skipped",
+            reason: "log_unavailable",
+            issueStatus: finalIssueState?.status ?? null,
+            ownCollection: managedMemoryCollectionName,
+            expectedChildCollections: managedMemoryExpectedChildCollections,
+            searchedCollections: [],
+            fetchedCollections: [],
+            hitCollections: [],
+            missingCollections: [],
+            unfetchedHitCollections: [],
+          };
+        }
+      }
+      let managedMemoryAudit = evaluateManagedMemoryAudit({
+        supportsManagedMemory,
+        outcome,
+        issueStatus: finalIssueState?.status ?? null,
+        changedFiles: [],
+      });
+
+      if (supportsManagedMemory && managedMemoryAgentHome && managedMemoryBefore) {
+        try {
+          const managedMemoryAfter = await snapshotManagedMemoryState(managedMemoryAgentHome);
+          managedMemoryAudit = evaluateManagedMemoryAudit({
+            supportsManagedMemory,
+            outcome,
+            issueStatus: finalIssueState?.status ?? null,
+            changedFiles: diffManagedMemorySnapshots(managedMemoryBefore, managedMemoryAfter),
+          });
+        } catch (error) {
+          logger.warn(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              issueId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "failed to audit managed agent memory after heartbeat",
+          );
+          managedMemoryAudit = {
+            status: "skipped",
+            reason: "audit_error",
+            issueStatus: null,
+            changedFiles: [],
+          };
+        }
+      }
+
+      const managedMemoryRecallMessage =
+        managedMemoryRecallAudit.status === "loaded"
+          ? "managed memory recall completed"
+          : managedMemoryRecallAudit.status === "partial"
+            ? "managed memory recall incomplete"
+            : managedMemoryRecallAudit.status === "missing"
+              ? "managed memory recall missing"
+              : managedMemoryRecallAudit.reason
+                ? `managed memory recall audit skipped (${managedMemoryRecallAudit.reason})`
+                : "managed memory recall audit skipped";
+      const shouldWarnOnManagedMemoryRecall =
+        finalIssueState?.status === "done" &&
+        (managedMemoryRecallAudit.status === "missing" || managedMemoryRecallAudit.status === "partial");
+
+      await appendRunEvent(currentRun, seq++, {
+        eventType: "memory.recall.audit",
+        stream: "system",
+        level: shouldWarnOnManagedMemoryRecall ? "warn" : "info",
+        message: managedMemoryRecallMessage,
+        payload: {
+          status: managedMemoryRecallAudit.status,
+          reason: managedMemoryRecallAudit.reason,
+          issueId: issueId ?? null,
+          issueStatus: managedMemoryRecallAudit.issueStatus,
+          issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
+          ownCollection: managedMemoryRecallAudit.ownCollection,
+          expectedChildCollections: managedMemoryRecallAudit.expectedChildCollections,
+          searchedCollections: managedMemoryRecallAudit.searchedCollections,
+          fetchedCollections: managedMemoryRecallAudit.fetchedCollections,
+          hitCollections: managedMemoryRecallAudit.hitCollections,
+          missingCollections: managedMemoryRecallAudit.missingCollections,
+          unfetchedHitCollections: managedMemoryRecallAudit.unfetchedHitCollections,
+          expectedSearchBrief: managedMemoryRecallBrief,
+        },
+      });
+
+      if (shouldWarnOnManagedMemoryRecall) {
+        logger.warn(
+          {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            issueId,
+            issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
+            ownCollection: managedMemoryRecallAudit.ownCollection,
+            missingCollections: managedMemoryRecallAudit.missingCollections,
+            unfetchedHitCollections: managedMemoryRecallAudit.unfetchedHitCollections,
+          },
+          "managed agent completed an issue without the required memory recall",
+        );
+      }
+
+      const managedMemoryMessage =
+        managedMemoryAudit.status === "written"
+          ? "managed memory updated"
+          : managedMemoryAudit.status === "missing"
+            ? "completed issue without managed memory write"
+            : managedMemoryAudit.reason
+              ? `managed memory audit skipped (${managedMemoryAudit.reason})`
+              : "managed memory audit skipped";
+
+      await appendRunEvent(currentRun, seq++, {
+        eventType: "memory.audit",
+        stream: "system",
+        level: managedMemoryAudit.status === "missing" ? "warn" : "info",
+        message: managedMemoryMessage,
+        payload: {
+          status: managedMemoryAudit.status,
+          reason: managedMemoryAudit.reason,
+          issueId: issueId ?? null,
+          issueStatus: managedMemoryAudit.issueStatus,
+          issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
+          changedFileCount: managedMemoryAudit.changedFiles.length,
+          changedFiles: managedMemoryAudit.changedFiles,
+          collectionName: managedMemoryCollectionName,
+        },
+      });
+
+      if (managedMemoryAudit.status === "missing") {
+        logger.warn(
+          {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            issueId,
+            issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
+            collectionName: managedMemoryCollectionName,
+          },
+          "managed agent completed an issue without writing memory files",
+        );
+      }
+
+      if (outcome === "succeeded" && supportsManagedAgentMemoryAdapter(agent.adapterType)) {
+        const refreshed = await refreshManagedAgentQmdCollection(agent.id, managedMemorySlug ?? deriveAgentUrlKey(agent.name));
+        if (!refreshed) {
+          logger.warn(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              collectionName: managedMemoryCollectionName,
+            },
+            "failed to refresh managed agent QMD collection after successful heartbeat",
+          );
+        }
+      }
 
       await setRunStatus(run.id, status, {
         finishedAt: new Date(),
