@@ -66,9 +66,24 @@ Use comments incrementally:
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
-**Step 7 — Do the work.** Use your tools and capabilities.
+**Step 7 — Recall relevant memory.** Before doing domain work, recall memory aligned with the requested issue.
 
-**Step 8 — Update status and communicate.** Always include the run ID header.
+- Build a compact recall brief from the issue title, description, goal, project, ancestor titles, and wake comment if present.
+- Search your own QMD collection with that recall brief.
+- If you manage direct reports and your `AGENTS.md` lists their collections, search each direct-report collection with the same recall brief.
+- If a search returns relevant hits, load at least one relevant item with `qmd get`, `qmd multi-get`, or the equivalent QMD MCP fetch tool before proceeding.
+
+**Step 8 — Do the work.** Use your tools and capabilities.
+
+**Step 9 — Persist memory.** Before marking a task `done`, persist what you learned.
+
+- For managed local agents, this is part of task completion, not optional cleanup.
+- Use `para-memory-files` for all memory writes.
+- Append meaningful task progress and outcomes to `$AGENT_HOME/memory/YYYY-MM-DD.md`.
+- Extract durable facts, decisions, and references to the right files under `$AGENT_HOME/life/`.
+- If the task produced reusable knowledge, verify it is discoverable with `qmd query ... --collection <your-collection>` or `qmd search ... --collection <your-collection>`.
+
+**Step 10 — Update status and communicate.** Always include the run ID header.
 If you are blocked at any point, you MUST update the issue to `blocked` before exiting the heartbeat, with a comment that explains the blocker and who needs to act.
 
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
@@ -85,7 +100,7 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 
 Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
 
-**Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
+**Step 11 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
 
 ## Project Setup Workflow (CEO/Manager Common Path)
 
@@ -140,12 +155,14 @@ If you are asked to install a skill for the company or an agent you MUST read:
 ## Critical Rules
 
 - **Always checkout** before working. Never PATCH to `in_progress` manually.
+- **Recall issue-aligned memory before domain work.** Search your own QMD collection and any direct-report collections you are allowed to access after loading `heartbeat-context`.
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.**
 - **Self-assign only for explicit @-mention handoff.** This requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch). Otherwise, no assignments = exit.
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign the issue to that user with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, and typically set status to `in_review` instead of `done`.
   Resolve requesting user id from the triggering comment thread (`authorUserId`) when available; otherwise use the issue's `createdByUserId` if it matches the requester context.
 - **Always comment** on `in_progress` work before exiting a heartbeat — **except** for blocked tasks with no new context (see blocked-task dedup in Step 4).
+- **Persist memory before `done`.** On managed local agents, write task outcomes to `$AGENT_HOME/memory/` and durable facts to `$AGENT_HOME/life/` before marking the issue complete.
 - **Always set `parentId`** on subtasks (and `goalId` unless you're CEO/manager creating top-level work).
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
 - **Always update blocked issues explicitly.** If blocked, PATCH status to `blocked` with a blocker comment before exiting, then escalate. On subsequent heartbeats, do NOT repeat the same blocked comment — see blocked-task dedup in Step 4.

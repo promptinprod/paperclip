@@ -41,6 +41,7 @@ import {
   secretService,
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
+  syncManagedInstructionsForAgent,
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
@@ -654,6 +655,36 @@ export function agentRoutes(db: Db) {
     };
   }
 
+  async function maybeAutoGenerateInstructions(
+    companyId: string,
+    agent: { id: string; reportsTo: string | null },
+  ) {
+    const syncedAgentIds = new Set([agent.id]);
+    if (agent.reportsTo) syncedAgentIds.add(agent.reportsTo);
+
+    for (const syncedAgentId of syncedAgentIds) {
+      const result = await syncManagedInstructionsForAgent(db, syncedAgentId);
+      if (result.skipped || !result.absolutePath) continue;
+
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "agent.instructions_auto_generated",
+        entityType: "agent",
+        entityId: syncedAgentId,
+        details: {
+          path: result.absolutePath,
+          written: result.written,
+          created: result.created,
+          updated: result.updated,
+          configPersisted: result.configPersisted,
+          collectionEnsured: result.collectionEnsured,
+        },
+      });
+    }
+  }
+
   router.param("id", async (req, _res, next, rawId) => {
     try {
       req.params.id = await normalizeAgentReference(req, String(rawId));
@@ -1207,6 +1238,8 @@ export function agentRoutes(db: Db) {
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
 
+    await maybeAutoGenerateInstructions(companyId, agent);
+
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     const actor = getActorInfo(req);
 
@@ -1351,6 +1384,8 @@ export function agentRoutes(db: Db) {
       lastHeartbeatAt: null,
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
+
+    await maybeAutoGenerateInstructions(companyId, agent);
 
     const actor = getActorInfo(req);
     await logActivity(db, {
