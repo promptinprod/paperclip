@@ -84,15 +84,24 @@ If `currentParticipant` matches you, submit your decision via the normal update 
 
 If `currentParticipant` does not match you, do not try to advance the stage — Paperclip will reject other actors with `422`.
 
-**Step 7 — Do the work.** Use your tools and capabilities. Execution contract:
+**Step 7 — Recall relevant memory.** Before doing domain work, recall memory aligned with the requested issue.
 
-- If the issue is actionable, start concrete work in the same heartbeat. Do not stop at a plan unless the issue specifically asks for planning.
-- Leave durable progress in comments, issue documents, or work products, and include the next action before you exit.
-- Use child issues for parallel or long delegated work; do not busy-poll agents, sessions, child issues, or processes waiting for completion.
-- If blocked, move the issue to `blocked` with the unblock owner and exact action needed.
-- Respect budget, pause/cancel, approval gates, execution policy stages, and company boundaries.
+- Build a compact recall brief from the issue title, description, goal, project, ancestor titles, and wake comment if present.
+- Search your own QMD collection with that recall brief.
+- If you manage direct reports and your `AGENTS.md` lists their collections, search each direct-report collection with the same recall brief.
+- If a search returns relevant hits, load at least one relevant item with `qmd get`, `qmd multi-get`, or the equivalent QMD MCP fetch tool before proceeding.
 
-**Step 8 — Update status and communicate.** Always include the run ID header.
+**Step 8 — Do the work.** Use your tools and capabilities.
+
+**Step 9 — Persist memory.** Before marking a task `done`, persist what you learned.
+
+- For managed local agents, this is part of task completion, not optional cleanup.
+- Use `para-memory-files` for all memory writes.
+- Append meaningful task progress and outcomes to `$AGENT_HOME/memory/YYYY-MM-DD.md`.
+- Extract durable facts, decisions, and references to the right files under `$AGENT_HOME/life/`.
+- If the task produced reusable knowledge, verify it is discoverable with `qmd query ... --collection <your-collection>` or `qmd search ... --collection <your-collection>`.
+
+**Step 10 — Update status and communicate.** Always include the run ID header.
 If you are blocked at any point, you MUST update the issue to `blocked` before exiting the heartbeat, with a comment that explains the blocker and who needs to act.
 
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
@@ -215,12 +224,14 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
+- **Recall issue-aligned memory before domain work.** Search your own QMD collection and any direct-report collections you are allowed to access after loading `heartbeat-context`.
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.
 - **Start actionable work before planning-only closure.** Do concrete work in the same heartbeat unless the task asks for a plan or review only.
 - **Leave a next action.** Every progress comment should make clear what is complete, what remains, and who owns the next step.
+- **Persist memory before `done`.** On managed local agents, write task outcomes to `$AGENT_HOME/memory/` and durable facts to `$AGENT_HOME/life/` before marking the issue complete.
 - **Prefer child issues over polling.** Create bounded child issues for long or parallel delegated work and rely on Paperclip wake events or comments for completion.
 - **Preserve workspace continuity for follow-ups.** Child issues inherit execution workspace from `parentId` server-side. For non-child follow-ups on the same checkout/worktree, send `inheritExecutionWorkspaceFromIssueId` explicitly.
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
