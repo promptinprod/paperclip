@@ -291,16 +291,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let instructionsPrefix = "";
   let instructionsChars = 0;
   if (instructionsFilePath) {
+    const resolvedInstructionsFilePath = path.isAbsolute(instructionsFilePath)
+      ? instructionsFilePath
+      : path.resolve(cwd, instructionsFilePath);
     try {
-      const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+      const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
       instructionsPrefix =
         `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
       instructionsChars = instructionsPrefix.length;
       await onLog(
         "stdout",
-        `[paperclip] Loaded agent instructions file: ${instructionsFilePath}\n`,
+        `[paperclip] Loaded agent instructions file: ${resolvedInstructionsFilePath}\n`,
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

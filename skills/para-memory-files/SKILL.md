@@ -95,7 +95,7 @@ qmd search "specific phrase"              # BM25 keyword search
 qmd vsearch "conceptual question"         # Pure vector similarity
 ```
 
-Index your personal folder: `qmd index $AGENT_HOME`
+Paperclip usually creates your personal collection automatically. If it is missing, run: `qmd collection add $AGENT_HOME --name <your-agent-collection>`
 
 Vectors + BM25 + reranking finds things even when the wording differs.
 

@@ -78,6 +78,7 @@ const mockSecretService = vi.hoisted(() => ({
 
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockSyncManagedInstructionsForAgent = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
@@ -90,6 +91,7 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
   secretService: () => mockSecretService,
   workspaceOperationService: () => mockWorkspaceOperationService,
+  syncManagedInstructionsForAgent: mockSyncManagedInstructionsForAgent,
 }));
 
 function createDbStub() {
@@ -144,6 +146,17 @@ describe("agent permission routes", () => {
     mockBudgetService.upsertPolicy.mockResolvedValue(undefined);
     mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
+    mockSyncManagedInstructionsForAgent.mockResolvedValue({
+      agentId,
+      absolutePath: null,
+      written: false,
+      created: false,
+      updated: false,
+      configPersisted: false,
+      collectionEnsured: false,
+      skipped: true,
+      reason: "instructions_path_unresolvable",
+    });
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -242,5 +255,47 @@ describe("agent permission routes", () => {
     );
     expect(res.body.access.canAssignTasks).toBe(true);
     expect(res.body.access.taskAssignSource).toBe("agent_creator");
+  });
+
+  it("syncs instructions for the new child and its direct parent", async () => {
+    const parentId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      id: "44444444-4444-4444-8444-444444444444",
+      name: "Founding Engineer",
+      reportsTo: parentId,
+      adapterType: "codex_local",
+      adapterConfig: { cwd: "/tmp/paperclip" },
+    });
+
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Founding Engineer",
+        role: "engineer",
+        reportsTo: parentId,
+        adapterType: "codex_local",
+        adapterConfig: { cwd: "/tmp/paperclip" },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockSyncManagedInstructionsForAgent).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      "44444444-4444-4444-8444-444444444444",
+    );
+    expect(mockSyncManagedInstructionsForAgent).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      parentId,
+    );
   });
 });

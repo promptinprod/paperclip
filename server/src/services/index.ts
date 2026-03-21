@@ -26,3 +26,13 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
+export {
+  shouldAutoGenerateInstructions,
+  resolveManagedInstructionsTarget,
+  renderManagedMemoryBlock,
+  renderInstructionsTemplate,
+  generateInstructionsFile,
+  syncManagedInstructionsForAgent,
+  initQmdCollection,
+  backfillAgentInstructions,
+} from "./agent-instructions.js";
