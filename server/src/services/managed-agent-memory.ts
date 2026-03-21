@@ -19,12 +19,67 @@ type QmdCommandResult = {
   errorMessage: string | null;
 };
 
+type ManagedAgentCollectionTarget = {
+  rootDir: string;
+  collectionName: string;
+};
+
+const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
+const PROJECT_MEMORY_DIR = "memory-projects";
+const LEGACY_REVIEW_DIR = "memory-legacy-review";
+
 export function supportsManagedAgentMemoryAdapter(adapterType: string | null | undefined): boolean {
   return Boolean(adapterType && SUPPORTED_MANAGED_AGENT_MEMORY_ADAPTER_TYPES.has(adapterType));
 }
 
+function normalizePathSegment(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!PATH_SEGMENT_RE.test(trimmed)) {
+    throw new Error(`Invalid ${label} '${value}'.`);
+  }
+  return trimmed;
+}
+
 export function buildManagedAgentCollectionName(slug: string): string {
   return `agent-${slug}`;
+}
+
+export function buildManagedAgentProjectCollectionName(slug: string, projectId: string): string {
+  return `agent-${slug}-project-${normalizePathSegment(projectId, "project id")}`;
+}
+
+export function buildManagedAgentLegacyReviewCollectionName(slug: string): string {
+  return `agent-${slug}-legacy-review`;
+}
+
+export function resolveManagedAgentProjectMemoryDir(agentId: string, projectId: string): string {
+  const baseDir = resolveDefaultAgentWorkspaceDir(agentId);
+  return path.resolve(baseDir, PROJECT_MEMORY_DIR, normalizePathSegment(projectId, "project id"));
+}
+
+export function resolveManagedAgentLegacyReviewDir(agentId: string): string {
+  return path.resolve(resolveDefaultAgentWorkspaceDir(agentId), LEGACY_REVIEW_DIR);
+}
+
+export function resolveManagedAgentProjectCollectionTarget(
+  agentId: string,
+  slug: string,
+  projectId: string,
+): ManagedAgentCollectionTarget {
+  return {
+    rootDir: resolveManagedAgentProjectMemoryDir(agentId, projectId),
+    collectionName: buildManagedAgentProjectCollectionName(slug, projectId),
+  };
+}
+
+export function resolveManagedAgentLegacyReviewCollectionTarget(
+  agentId: string,
+  slug: string,
+): ManagedAgentCollectionTarget {
+  return {
+    rootDir: resolveManagedAgentLegacyReviewDir(agentId),
+    collectionName: buildManagedAgentLegacyReviewCollectionName(slug),
+  };
 }
 
 async function runQmd(args: string[]): Promise<QmdCommandResult> {
@@ -63,41 +118,39 @@ async function removeManagedAgentCollection(collectionName: string): Promise<Qmd
   return runQmd(["collection", "remove", collectionName]);
 }
 
-export async function initManagedAgentQmdCollection(agentId: string, slug: string): Promise<boolean> {
+async function initManagedAgentQmdCollectionTarget(target: ManagedAgentCollectionTarget): Promise<boolean> {
   try {
-    const agentHome = resolveDefaultAgentWorkspaceDir(agentId);
-    await fs.mkdir(agentHome, { recursive: true });
+    await fs.mkdir(target.rootDir, { recursive: true });
 
-    const collectionName = buildManagedAgentCollectionName(slug);
-    const existing = await runQmd(["collection", "show", collectionName]);
+    const existing = await runQmd(["collection", "show", target.collectionName]);
     if (existing.ok) {
       const existingPath = parseCollectionPath(existing.stdout);
       if (!existingPath) {
         console.warn(
-          `[managed-agent-memory] Existing QMD collection ${collectionName} could not be parsed from output.`,
+          `[managed-agent-memory] Existing QMD collection ${target.collectionName} could not be parsed from output.`,
         );
         return false;
       }
-      if (path.resolve(existingPath) === path.resolve(agentHome)) {
+      if (path.resolve(existingPath) === path.resolve(target.rootDir)) {
         return true;
       }
       console.warn(
-        `[managed-agent-memory] QMD collection ${collectionName} already points to ${existingPath}, expected ${agentHome}.`,
+        `[managed-agent-memory] QMD collection ${target.collectionName} already points to ${existingPath}, expected ${target.rootDir}.`,
       );
       return false;
     }
 
     if (!isMissingCollectionResult(existing)) {
       console.warn(
-        `[managed-agent-memory] Failed to inspect QMD collection ${collectionName}: ${formatQmdFailure(existing)}`,
+        `[managed-agent-memory] Failed to inspect QMD collection ${target.collectionName}: ${formatQmdFailure(existing)}`,
       );
       return false;
     }
 
-    const created = await addManagedAgentCollection(agentHome, collectionName);
+    const created = await addManagedAgentCollection(target.rootDir, target.collectionName);
     if (!created.ok) {
       console.warn(
-        `[managed-agent-memory] Failed to create QMD collection ${collectionName}: ${formatQmdFailure(created)}`,
+        `[managed-agent-memory] Failed to create QMD collection ${target.collectionName}: ${formatQmdFailure(created)}`,
       );
       return false;
     }
@@ -108,47 +161,45 @@ export async function initManagedAgentQmdCollection(agentId: string, slug: strin
   }
 }
 
-export async function refreshManagedAgentQmdCollection(agentId: string, slug: string): Promise<boolean> {
+async function refreshManagedAgentQmdCollectionTarget(target: ManagedAgentCollectionTarget): Promise<boolean> {
   try {
-    const agentHome = resolveDefaultAgentWorkspaceDir(agentId);
-    await fs.mkdir(agentHome, { recursive: true });
+    await fs.mkdir(target.rootDir, { recursive: true });
 
-    const collectionName = buildManagedAgentCollectionName(slug);
-    const existing = await runQmd(["collection", "show", collectionName]);
+    const existing = await runQmd(["collection", "show", target.collectionName]);
     if (existing.ok) {
       const existingPath = parseCollectionPath(existing.stdout);
       if (!existingPath) {
         console.warn(
-          `[managed-agent-memory] Existing QMD collection ${collectionName} could not be parsed from output during refresh.`,
+          `[managed-agent-memory] Existing QMD collection ${target.collectionName} could not be parsed from output during refresh.`,
         );
         return false;
       }
-      if (path.resolve(existingPath) !== path.resolve(agentHome)) {
+      if (path.resolve(existingPath) !== path.resolve(target.rootDir)) {
         console.warn(
-          `[managed-agent-memory] Replacing QMD collection ${collectionName} from ${existingPath} to ${agentHome}.`,
+          `[managed-agent-memory] Replacing QMD collection ${target.collectionName} from ${existingPath} to ${target.rootDir}.`,
         );
       }
 
       // QMD does not expose a reliable collection-scoped refresh command, so rebuild the
       // managed collection to force the index to pick up fresh agent-authored files.
-      const removed = await removeManagedAgentCollection(collectionName);
+      const removed = await removeManagedAgentCollection(target.collectionName);
       if (!removed.ok && !isMissingCollectionResult(removed)) {
         console.warn(
-          `[managed-agent-memory] Failed to remove QMD collection ${collectionName} during refresh: ${formatQmdFailure(removed)}`,
+          `[managed-agent-memory] Failed to remove QMD collection ${target.collectionName} during refresh: ${formatQmdFailure(removed)}`,
         );
         return false;
       }
     } else if (!isMissingCollectionResult(existing)) {
       console.warn(
-        `[managed-agent-memory] Failed to inspect QMD collection ${collectionName} during refresh: ${formatQmdFailure(existing)}`,
+        `[managed-agent-memory] Failed to inspect QMD collection ${target.collectionName} during refresh: ${formatQmdFailure(existing)}`,
       );
       return false;
     }
 
-    const recreated = await addManagedAgentCollection(agentHome, collectionName);
+    const recreated = await addManagedAgentCollection(target.rootDir, target.collectionName);
     if (!recreated.ok) {
       console.warn(
-        `[managed-agent-memory] Failed to refresh QMD collection ${collectionName}: ${formatQmdFailure(recreated)}`,
+        `[managed-agent-memory] Failed to refresh QMD collection ${target.collectionName}: ${formatQmdFailure(recreated)}`,
       );
       return false;
     }
@@ -158,4 +209,48 @@ export async function refreshManagedAgentQmdCollection(agentId: string, slug: st
     console.warn("[managed-agent-memory] Failed to refresh QMD collection:", err);
     return false;
   }
+}
+
+export async function initManagedAgentQmdCollection(agentId: string, slug: string): Promise<boolean> {
+  return initManagedAgentQmdCollectionTarget({
+    rootDir: resolveDefaultAgentWorkspaceDir(agentId),
+    collectionName: buildManagedAgentCollectionName(slug),
+  });
+}
+
+export async function initManagedAgentProjectQmdCollection(
+  agentId: string,
+  slug: string,
+  projectId: string,
+): Promise<boolean> {
+  return initManagedAgentQmdCollectionTarget(resolveManagedAgentProjectCollectionTarget(agentId, slug, projectId));
+}
+
+export async function initManagedAgentLegacyReviewQmdCollection(
+  agentId: string,
+  slug: string,
+): Promise<boolean> {
+  return initManagedAgentQmdCollectionTarget(resolveManagedAgentLegacyReviewCollectionTarget(agentId, slug));
+}
+
+export async function refreshManagedAgentQmdCollection(agentId: string, slug: string): Promise<boolean> {
+  return refreshManagedAgentQmdCollectionTarget({
+    rootDir: resolveDefaultAgentWorkspaceDir(agentId),
+    collectionName: buildManagedAgentCollectionName(slug),
+  });
+}
+
+export async function refreshManagedAgentProjectQmdCollection(
+  agentId: string,
+  slug: string,
+  projectId: string,
+): Promise<boolean> {
+  return refreshManagedAgentQmdCollectionTarget(resolveManagedAgentProjectCollectionTarget(agentId, slug, projectId));
+}
+
+export async function refreshManagedAgentLegacyReviewQmdCollection(
+  agentId: string,
+  slug: string,
+): Promise<boolean> {
+  return refreshManagedAgentQmdCollectionTarget(resolveManagedAgentLegacyReviewCollectionTarget(agentId, slug));
 }

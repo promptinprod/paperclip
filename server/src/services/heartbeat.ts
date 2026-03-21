@@ -59,10 +59,13 @@ import {
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import {
-  buildManagedAgentCollectionName,
-  refreshManagedAgentQmdCollection,
+  buildManagedAgentProjectCollectionName,
+  initManagedAgentProjectQmdCollection,
+  refreshManagedAgentProjectQmdCollection,
+  resolveManagedAgentProjectMemoryDir,
   supportsManagedAgentMemoryAdapter,
 } from "./managed-agent-memory.js";
+import { migrateLegacyManagedAgentMemory } from "./managed-agent-memory-migration.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -217,6 +220,7 @@ export type ManagedMemorySnapshot = Record<string, ManagedMemoryFileMetadata>;
 
 export type ManagedMemoryAuditReason =
   | "unsupported_adapter"
+  | "project_required"
   | "run_not_succeeded"
   | "no_issue"
   | "issue_not_done"
@@ -249,6 +253,7 @@ export interface ManagedMemoryRecallDetection {
 
 export type ManagedMemoryRecallAuditReason =
   | "unsupported_adapter"
+  | "project_required"
   | "run_not_succeeded"
   | "no_issue"
   | "log_unavailable"
@@ -362,6 +367,34 @@ function detectCliRecallCollections(
   return uniqueSorted(found);
 }
 
+function buildEnvVarPattern(envName: string): string {
+  return `(?:\\$${escapeRegex(envName)}|\\$\\{${escapeRegex(envName)}\\})`;
+}
+
+function commandUsesCollectionEnvVar(
+  command: string,
+  subcommands: readonly string[],
+  envName: string,
+): boolean {
+  const pattern = new RegExp(
+    `(?:^|\\s)qmd\\s+(?:${subcommands.join("|")})\\b[\\s\\S]*?(?:--collection|-c)\\s+["']?${buildEnvVarPattern(envName)}(?:["']|\\b)`,
+    "i",
+  );
+  return pattern.test(command);
+}
+
+function commandUsesQmdUriEnvVar(
+  command: string,
+  subcommands: readonly string[],
+  envName: string,
+): boolean {
+  const pattern = new RegExp(
+    `(?:^|\\s)qmd\\s+(?:${subcommands.join("|")})\\b[\\s\\S]*?qmd://${buildEnvVarPattern(envName)}/`,
+    "i",
+  );
+  return pattern.test(command);
+}
+
 function detectCliFetchCollections(command: string, targetCollections: Set<string>): string[] {
   const found = new Set<string>();
   for (const collection of targetCollections) {
@@ -415,9 +448,14 @@ function extractToolUsesFromChunk(chunk: Record<string, unknown>): Array<{ name:
 
 export function detectManagedMemoryRecallFromRunLog(
   logContent: string,
-  targetCollections: string[],
+  input: {
+    ownCollection: string | null;
+    expectedChildCollections: string[];
+  },
 ): ManagedMemoryRecallDetection {
-  const targetSet = new Set(targetCollections.filter(Boolean));
+  const ownCollection = input.ownCollection?.trim() || null;
+  const expectedChildCollections = uniqueSorted(input.expectedChildCollections.filter(Boolean));
+  const targetSet = new Set([ownCollection, ...expectedChildCollections].filter((value): value is string => Boolean(value)));
   const searchedCollections = new Set<string>();
   const fetchedCollections = new Set<string>();
   const hitCollections = new Set<string>();
@@ -438,8 +476,32 @@ export function detectManagedMemoryRecallFromRunLog(
           for (const collection of detectCliRecallCollections(command, targetSet, ["query", "search"])) {
             searchedCollections.add(collection);
           }
+          if (ownCollection && commandUsesCollectionEnvVar(command, ["query", "search"], "PAPERCLIP_MEMORY_COLLECTION")) {
+            searchedCollections.add(ownCollection);
+          }
+          if (
+            expectedChildCollections.length > 0 &&
+            command.includes("PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON") &&
+            /(?:^|\s)qmd\s+(?:query|search)\b/i.test(command)
+          ) {
+            for (const collection of expectedChildCollections) {
+              searchedCollections.add(collection);
+            }
+          }
           for (const collection of detectCliFetchCollections(command, targetSet)) {
             fetchedCollections.add(collection);
+          }
+          if (ownCollection && commandUsesQmdUriEnvVar(command, ["get", "multi-get"], "PAPERCLIP_MEMORY_COLLECTION")) {
+            fetchedCollections.add(ownCollection);
+          }
+          if (
+            expectedChildCollections.length > 0 &&
+            command.includes("PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON") &&
+            /(?:^|\s)qmd\s+(?:get|multi-get)\b/i.test(command)
+          ) {
+            for (const collection of expectedChildCollections) {
+              fetchedCollections.add(collection);
+            }
           }
           continue;
         }
@@ -476,6 +538,7 @@ export function detectManagedMemoryRecallFromRunLog(
 export function evaluateManagedMemoryRecallAudit(input: {
   supportsManagedMemory: boolean;
   outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  projectId: string | null;
   issueStatus: string | null;
   hasIssue: boolean;
   ownCollection: string | null;
@@ -509,6 +572,21 @@ export function evaluateManagedMemoryRecallAudit(input: {
     return {
       status: "skipped",
       reason: "run_not_succeeded",
+      issueStatus: input.issueStatus,
+      ownCollection,
+      expectedChildCollections,
+      searchedCollections,
+      fetchedCollections,
+      hitCollections,
+      missingCollections: [],
+      unfetchedHitCollections: [],
+    };
+  }
+
+  if (!input.projectId) {
+    return {
+      status: "skipped",
+      reason: "project_required",
       issueStatus: input.issueStatus,
       ownCollection,
       expectedChildCollections,
@@ -682,6 +760,7 @@ export function diffManagedMemorySnapshots(
 export function evaluateManagedMemoryAudit(input: {
   supportsManagedMemory: boolean;
   outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  projectId: string | null;
   issueStatus: string | null;
   changedFiles: string[];
 }): ManagedMemoryAudit {
@@ -700,6 +779,15 @@ export function evaluateManagedMemoryAudit(input: {
       reason: "run_not_succeeded",
       issueStatus: input.issueStatus,
       changedFiles: input.changedFiles,
+    };
+  }
+
+  if (!input.projectId) {
+    return {
+      status: "skipped",
+      reason: "project_required",
+      issueStatus: input.issueStatus,
+      changedFiles: [],
     };
   }
 
@@ -763,7 +851,10 @@ async function readRunLogContent(handle: RunLogHandle): Promise<string> {
 async function listManagedDirectReportCollections(
   db: Db,
   managerId: string,
+  projectId: string | null,
 ): Promise<string[]> {
+  if (!projectId) return [];
+
   const rows = await db
     .select({
       name: agents.name,
@@ -775,7 +866,7 @@ async function listManagedDirectReportCollections(
   return uniqueSorted(
     rows
       .filter((row) => supportsManagedAgentMemoryAdapter(row.adapterType))
-      .map((row) => buildManagedAgentCollectionName(deriveAgentUrlKey(row.name))),
+      .map((row) => buildManagedAgentProjectCollectionName(deriveAgentUrlKey(row.name), projectId)),
   );
 }
 
@@ -3491,26 +3582,80 @@ export function heartbeatService(db: Db) {
         );
       }
       const supportsManagedMemory = supportsManagedAgentMemoryAdapter(agent.adapterType);
-      const managedMemoryAgentHome = supportsManagedMemory ? resolveDefaultAgentWorkspaceDir(agent.id) : null;
       const managedMemorySlug = supportsManagedMemory ? deriveAgentUrlKey(agent.name) : null;
+      if (supportsManagedMemory && managedMemorySlug) {
+        try {
+          await migrateLegacyManagedAgentMemory({
+            db,
+            agentId: agent.id,
+            companyId: agent.companyId,
+            slug: managedMemorySlug,
+          });
+        } catch (error) {
+          logger.warn(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "failed to migrate legacy managed memory",
+          );
+        }
+      }
+      const managedMemoryProjectId = supportsManagedMemory ? resolvedProjectId : null;
+      const managedMemoryProjectRow =
+        supportsManagedMemory && managedMemoryProjectId
+          ? await db
+              .select({ name: projects.name })
+              .from(projects)
+              .where(and(eq(projects.id, managedMemoryProjectId), eq(projects.companyId, agent.companyId)))
+              .then((rows) => rows[0] ?? null)
+          : null;
+      const managedMemoryAgentHome =
+        supportsManagedMemory && managedMemoryProjectId
+          ? resolveManagedAgentProjectMemoryDir(agent.id, managedMemoryProjectId)
+          : null;
       const managedMemoryCollectionName =
-        managedMemorySlug ? buildManagedAgentCollectionName(managedMemorySlug) : null;
+        managedMemorySlug && managedMemoryProjectId
+          ? buildManagedAgentProjectCollectionName(managedMemorySlug, managedMemoryProjectId)
+          : null;
       const managedMemoryExpectedChildCollections = supportsManagedMemory
-        ? await listManagedDirectReportCollections(db, agent.id)
+        ? await listManagedDirectReportCollections(db, agent.id, managedMemoryProjectId)
         : [];
+      context.paperclipWorkspace = {
+        ...parseObject(context.paperclipWorkspace),
+        projectId: managedMemoryProjectId,
+        projectName: managedMemoryProjectRow?.name ?? null,
+        agentHome: managedMemoryAgentHome,
+        memoryCollection: managedMemoryCollectionName,
+        directReportMemoryCollections: managedMemoryExpectedChildCollections,
+      };
+      if (supportsManagedMemory && managedMemoryProjectId && managedMemorySlug) {
+        const collectionEnsured = await initManagedAgentProjectQmdCollection(
+          agent.id,
+          managedMemorySlug,
+          managedMemoryProjectId,
+        );
+        if (!collectionEnsured) {
+          logger.warn(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              projectId: managedMemoryProjectId,
+              collectionName: managedMemoryCollectionName,
+            },
+            "failed to initialize managed project-scoped QMD collection before heartbeat",
+          );
+        }
+      }
       const managedMemoryRecallBrief =
         supportsManagedMemory && issueContext
           ? await (async () => {
               const wakeCommentId = readNonEmptyString(context.wakeCommentId);
-              const [ancestors, projectRow, goalRow, wakeComment] = await Promise.all([
+              const [ancestors, goalRow, wakeComment] = await Promise.all([
                 issuesSvc.getAncestors(issueContext.id),
-                issueContext.projectId
-                  ? db
-                      .select({ name: projects.name })
-                      .from(projects)
-                      .where(and(eq(projects.id, issueContext.projectId), eq(projects.companyId, agent.companyId)))
-                      .then((rows) => rows[0] ?? null)
-                  : null,
                 issueContext.goalId
                   ? db
                       .select({ title: goals.title })
@@ -3526,7 +3671,7 @@ export function heartbeatService(db: Db) {
                 issueTitle: issueContext.title,
                 issueDescription: issueContext.description ?? null,
                 goalTitle: goalRow?.title ?? null,
-                projectName: projectRow?.name ?? null,
+                projectName: managedMemoryProjectRow?.name ?? null,
                 ancestorTitles: ancestors.map((ancestor) => ancestor.title),
                 wakeCommentBody:
                   wakeComment && wakeComment.issueId === issueContext.id ? wakeComment.body ?? null : null,
@@ -3678,6 +3823,7 @@ export function heartbeatService(db: Db) {
       let managedMemoryRecallAudit: ManagedMemoryRecallAudit = evaluateManagedMemoryRecallAudit({
         supportsManagedMemory,
         outcome,
+        projectId: managedMemoryProjectId,
         issueStatus: finalIssueState?.status ?? null,
         hasIssue: Boolean(issueId),
         ownCollection: managedMemoryCollectionName,
@@ -3688,17 +3834,18 @@ export function heartbeatService(db: Db) {
           hitCollections: [],
         },
       });
-      if (supportsManagedMemory) {
+      if (supportsManagedMemory && managedMemoryProjectId) {
         if (handle) {
           try {
             const runLogContent = await readRunLogContent(handle);
-            const recallDetection = detectManagedMemoryRecallFromRunLog(runLogContent, [
-              managedMemoryCollectionName ?? "",
-              ...managedMemoryExpectedChildCollections,
-            ]);
+            const recallDetection = detectManagedMemoryRecallFromRunLog(runLogContent, {
+              ownCollection: managedMemoryCollectionName,
+              expectedChildCollections: managedMemoryExpectedChildCollections,
+            });
             managedMemoryRecallAudit = evaluateManagedMemoryRecallAudit({
               supportsManagedMemory,
               outcome,
+              projectId: managedMemoryProjectId,
               issueStatus: finalIssueState?.status ?? null,
               hasIssue: Boolean(issueId),
               ownCollection: managedMemoryCollectionName,
@@ -3747,6 +3894,7 @@ export function heartbeatService(db: Db) {
       let managedMemoryAudit = evaluateManagedMemoryAudit({
         supportsManagedMemory,
         outcome,
+        projectId: managedMemoryProjectId,
         issueStatus: finalIssueState?.status ?? null,
         changedFiles: [],
       });
@@ -3757,6 +3905,7 @@ export function heartbeatService(db: Db) {
           managedMemoryAudit = evaluateManagedMemoryAudit({
             supportsManagedMemory,
             outcome,
+            projectId: managedMemoryProjectId,
             issueStatus: finalIssueState?.status ?? null,
             changedFiles: diffManagedMemorySnapshots(managedMemoryBefore, managedMemoryAfter),
           });
@@ -3792,7 +3941,11 @@ export function heartbeatService(db: Db) {
                 : "managed memory recall audit skipped";
       const shouldWarnOnManagedMemoryRecall =
         finalIssueState?.status === "done" &&
-        (managedMemoryRecallAudit.status === "missing" || managedMemoryRecallAudit.status === "partial");
+        (
+          managedMemoryRecallAudit.status === "missing" ||
+          managedMemoryRecallAudit.status === "partial" ||
+          managedMemoryRecallAudit.reason === "project_required"
+        );
 
       await appendRunEvent(currentRun, seq++, {
         eventType: "memory.recall.audit",
@@ -3803,6 +3956,7 @@ export function heartbeatService(db: Db) {
           status: managedMemoryRecallAudit.status,
           reason: managedMemoryRecallAudit.reason,
           issueId: issueId ?? null,
+          projectId: managedMemoryProjectId,
           issueStatus: managedMemoryRecallAudit.issueStatus,
           issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
           ownCollection: managedMemoryRecallAudit.ownCollection,
@@ -3844,12 +3998,16 @@ export function heartbeatService(db: Db) {
       await appendRunEvent(currentRun, seq++, {
         eventType: "memory.audit",
         stream: "system",
-        level: managedMemoryAudit.status === "missing" ? "warn" : "info",
+        level:
+          managedMemoryAudit.status === "missing" || managedMemoryAudit.reason === "project_required"
+            ? "warn"
+            : "info",
         message: managedMemoryMessage,
         payload: {
           status: managedMemoryAudit.status,
           reason: managedMemoryAudit.reason,
           issueId: issueId ?? null,
+          projectId: managedMemoryProjectId,
           issueStatus: managedMemoryAudit.issueStatus,
           issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
           changedFileCount: managedMemoryAudit.changedFiles.length,
@@ -3858,13 +4016,14 @@ export function heartbeatService(db: Db) {
         },
       });
 
-      if (managedMemoryAudit.status === "missing") {
+      if (managedMemoryAudit.status === "missing" || managedMemoryAudit.reason === "project_required") {
         logger.warn(
           {
             companyId: agent.companyId,
             agentId: agent.id,
             runId: run.id,
             issueId,
+            projectId: managedMemoryProjectId,
             issueIdentifier: finalIssueState?.identifier ?? issueContext?.identifier ?? null,
             collectionName: managedMemoryCollectionName,
           },
@@ -3872,14 +4031,19 @@ export function heartbeatService(db: Db) {
         );
       }
 
-      if (outcome === "succeeded" && supportsManagedAgentMemoryAdapter(agent.adapterType)) {
-        const refreshed = await refreshManagedAgentQmdCollection(agent.id, managedMemorySlug ?? deriveAgentUrlKey(agent.name));
+      if (outcome === "succeeded" && supportsManagedAgentMemoryAdapter(agent.adapterType) && managedMemoryProjectId && managedMemorySlug) {
+        const refreshed = await refreshManagedAgentProjectQmdCollection(
+          agent.id,
+          managedMemorySlug,
+          managedMemoryProjectId,
+        );
         if (!refreshed) {
           logger.warn(
             {
               companyId: agent.companyId,
               agentId: agent.id,
               runId: run.id,
+              projectId: managedMemoryProjectId,
               collectionName: managedMemoryCollectionName,
             },
             "failed to refresh managed agent QMD collection after successful heartbeat",

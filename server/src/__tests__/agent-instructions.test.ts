@@ -18,7 +18,11 @@ import {
   resolveManagedInstructionsTarget,
   shouldAutoGenerateInstructions,
 } from "../services/agent-instructions.js";
-import { refreshManagedAgentQmdCollection } from "../services/managed-agent-memory.js";
+import {
+  initManagedAgentProjectQmdCollection,
+  refreshManagedAgentProjectQmdCollection,
+  resolveManagedAgentProjectMemoryDir,
+} from "../services/managed-agent-memory.js";
 
 const cleanupDirs = new Set<string>();
 const originalPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -27,23 +31,6 @@ async function makeTempDir(prefix: string) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   cleanupDirs.add(dir);
   return dir;
-}
-
-function execSuccess(stdout = "", stderr = "") {
-  return (command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-    expect(command).toBe("qmd");
-    cb(null, stdout, stderr);
-  };
-}
-
-function execFailure(
-  message: string,
-  stdout = "",
-  stderr = "",
-) {
-  return (_command: string, _args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-    cb(new Error(message), stdout, stderr);
-  };
 }
 
 afterEach(async () => {
@@ -144,27 +131,32 @@ describe("renderInstructionsTemplate", () => {
     expect(content).toContain("# Founding Engineer");
     expect(content).toContain("**Role:** engineer");
     expect(content).toContain("**Title:** Senior Software Engineer");
-    expect(content).toContain("agent-founding-engineer");
     expect(content).toContain("You MUST use the `para-memory-files` skill for all memory operations");
     expect(content).toContain("Invoke it whenever you need to remember, retrieve, or organize anything.");
+    expect(content).toContain("Managed local memory is project-scoped.");
     expect(content).toContain(
       "After loading issue context for a task, build a compact recall brief from the issue title, description, goal, project, ancestor titles, and wake comment if present.",
     );
-    expect(content).toContain("Search your own QMD collection with that recall brief before doing domain work.");
+    expect(content).toContain("Search the current project's QMD collection with that recall brief before doing domain work.");
     expect(content).toContain(
-      "If you manage direct reports, search each direct-report collection you are allowed to access with the same recall brief.",
+      "If you manage direct reports, search each same-project direct-report collection listed in `$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON`.",
     );
     expect(content).toContain("Write meaningful task progress and outcomes to `$AGENT_HOME/memory/YYYY-MM-DD.md`.");
     expect(content).toContain("Extract durable facts, decisions, and references to the relevant files under `$AGENT_HOME/life/`.");
     expect(content).toContain("Before considering a task complete, write the outcome to memory:");
     expect(content).toContain("Append progress and outcomes to `$AGENT_HOME/memory/YYYY-MM-DD.md`.");
     expect(content).toContain(
-      "Verify the memory is discoverable with `qmd query ... --collection agent-founding-engineer` or `qmd search ... --collection agent-founding-engineer`.",
+      'Verify the memory is discoverable with `qmd query ... --collection "$PAPERCLIP_MEMORY_COLLECTION"` or `qmd search ... --collection "$PAPERCLIP_MEMORY_COLLECTION"`.',
     );
-    expect(content).toContain("qmd collection add $AGENT_HOME --name agent-founding-engineer");
-    expect(content).toContain("Your direct manager (CEO) may read and update your collection.");
+    expect(content).toContain('qmd collection add $AGENT_HOME --name "$PAPERCLIP_MEMORY_COLLECTION"');
     expect(content).toContain(
-      "Direct-report collections you may read and update: `agent-growth-engineer`, `agent-product-designer`",
+      "Your direct manager (CEO) may read and update the current project's collection when they are working on the same project.",
+    );
+    expect(content).toContain(
+      "Same-project direct-report collections you may read and update are provided at runtime in `$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON`.",
+    );
+    expect(content).toContain(
+      "Runs without a project do not participate in managed QMD memory. Assign the work to a project before relying on managed recall or managed writes.",
     );
   });
 
@@ -176,7 +168,7 @@ describe("renderInstructionsTemplate", () => {
     });
 
     expect(content).toContain("You have no direct manager configured.");
-    expect(content).toContain("Direct-report collections you may read and update: none.");
+    expect(content).toContain("Your current project collection: `$PAPERCLIP_MEMORY_COLLECTION`");
   });
 });
 
@@ -199,11 +191,11 @@ describe("generateInstructionsFile", () => {
     expect(result).toMatchObject({ written: true, created: true, updated: false, mode: "created" });
     expect(content).toContain(MANAGED_MEMORY_BEGIN_MARKER);
     expect(content).toContain("You MUST use the `para-memory-files` skill for all memory operations");
-    expect(content).toContain("Search your own QMD collection with that recall brief before doing domain work.");
+    expect(content).toContain("Search the current project's QMD collection with that recall brief before doing domain work.");
     expect(content).toContain("Write meaningful task progress and outcomes to `$AGENT_HOME/memory/YYYY-MM-DD.md`.");
     expect(content).toContain("Before considering a task complete, write the outcome to memory:");
-    expect(content).toContain("Your own collection: `agent-engineer`");
-    expect(content).toContain("Direct-report collections you may read and update: `agent-qa`");
+    expect(content).toContain("Your current project collection: `$PAPERCLIP_MEMORY_COLLECTION`");
+    expect(content).toContain("Same-project direct-report collections you may read and update are provided at runtime");
   });
 
   it("replaces an existing managed block without touching the rest of the file", async () => {
@@ -242,13 +234,13 @@ Keep me
     expect(content).toContain("Keep me");
     expect(content).not.toContain("old memory");
     expect(content).toContain(
-      "If you manage direct reports, search each direct-report collection you are allowed to access with the same recall brief.",
+      "If you manage direct reports, search each same-project direct-report collection listed in `$PAPERCLIP_DIRECT_REPORT_MEMORY_COLLECTIONS_JSON`.",
     );
     expect(content).toContain("Extract durable facts, decisions, and references to the relevant files under `$AGENT_HOME/life/`.");
-    expect(content).toContain("Verify the memory is discoverable with `qmd query ... --collection agent-engineer` or `qmd search ... --collection agent-engineer`.");
     expect(content).toContain(
-      "Direct-report collections you may read and update: `agent-design`, `agent-qa`",
+      'Verify the memory is discoverable with `qmd query ... --collection "$PAPERCLIP_MEMORY_COLLECTION"` or `qmd search ... --collection "$PAPERCLIP_MEMORY_COLLECTION"`.',
     );
+    expect(content).toContain("Same-project direct-report collections you may read and update are provided at runtime");
   });
 
   it("replaces the legacy memory section in older generated files", async () => {
@@ -293,149 +285,69 @@ Preserve this
 });
 
 describe("initQmdCollection", () => {
-  it("returns true when the collection already exists for the expected agent home", async () => {
-    const paperclipHome = await makeTempDir("paperclip-qmd-home-");
-    process.env.PAPERCLIP_HOME = paperclipHome;
-    const agentId = "11111111-1111-4111-8111-111111111111";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
-
-    mockExecFile.mockImplementation(
-      execSuccess(`Collection: agent-engineer\n  Path:     ${expectedAgentHome}\n`, ""),
-    );
-
-    await expect(initQmdCollection(agentId, "engineer")).resolves.toBe(true);
-    expect(mockExecFile).toHaveBeenCalledTimes(1);
-    expect(mockExecFile).toHaveBeenCalledWith(
-      "qmd",
-      ["collection", "show", "agent-engineer"],
-      expect.any(Function),
-    );
-  });
-
-  it("creates the collection when it does not exist yet", async () => {
-    const paperclipHome = await makeTempDir("paperclip-qmd-add-");
-    process.env.PAPERCLIP_HOME = paperclipHome;
-    const agentId = "22222222-2222-4222-8222-222222222222";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
-
-    mockExecFile.mockImplementation((command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-      expect(command).toBe("qmd");
-      if (args[0] === "collection" && args[1] === "show") {
-        cb(new Error("Collection not found: agent-data"), "", "Collection not found: agent-data");
-        return;
-      }
-      if (args[0] === "collection" && args[1] === "add") {
-        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-data"]);
-        cb(null, "created", "");
-        return;
-      }
-      cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
-    });
-
-    await expect(initQmdCollection(agentId, "data")).resolves.toBe(true);
-    expect(mockExecFile).toHaveBeenCalledTimes(2);
-  });
-
-  it("returns false when the collection name already exists for a different path", async () => {
-    const paperclipHome = await makeTempDir("paperclip-qmd-mismatch-");
-    process.env.PAPERCLIP_HOME = paperclipHome;
-    const agentId = "33333333-3333-4333-8333-333333333333";
-
-    mockExecFile.mockImplementation(
-      execSuccess("Collection: agent-ops\n  Path:     /tmp/other-agent-home\n", ""),
-    );
-
-    await expect(initQmdCollection(agentId, "ops")).resolves.toBe(false);
-    expect(mockExecFile).toHaveBeenCalledTimes(1);
-  });
-
-  it("returns false when qmd inspection fails for another reason", async () => {
-    const paperclipHome = await makeTempDir("paperclip-qmd-failure-");
-    process.env.PAPERCLIP_HOME = paperclipHome;
-    const agentId = "44444444-4444-4444-8444-444444444444";
-
-    mockExecFile.mockImplementation(execFailure("spawn qmd ENOENT"));
-
-    await expect(initQmdCollection(agentId, "ops")).resolves.toBe(false);
-    expect(mockExecFile).toHaveBeenCalledTimes(1);
+  it("is a no-op because managed memory is now project-scoped", async () => {
+    await expect(initQmdCollection("11111111-1111-4111-8111-111111111111", "engineer")).resolves.toBe(false);
+    expect(mockExecFile).not.toHaveBeenCalled();
   });
 });
 
-describe("refreshManagedAgentQmdCollection", () => {
+describe("project-scoped qmd collections", () => {
   it("rebuilds an existing collection for the expected agent home", async () => {
     const paperclipHome = await makeTempDir("paperclip-qmd-refresh-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     const agentId = "55555555-5555-4555-8555-555555555555";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
+    const projectId = "project-1";
+    const expectedAgentHome = resolveManagedAgentProjectMemoryDir(agentId, projectId);
 
     mockExecFile.mockImplementation((command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
       expect(command).toBe("qmd");
       if (args[0] === "collection" && args[1] === "show") {
-        cb(null, `Collection: agent-cpo-2\n  Path:     ${expectedAgentHome}\n`, "");
+        cb(null, `Collection: agent-cpo-2-project-project-1\n  Path:     ${expectedAgentHome}\n`, "");
         return;
       }
       if (args[0] === "collection" && args[1] === "remove") {
-        expect(args).toEqual(["collection", "remove", "agent-cpo-2"]);
+        expect(args).toEqual(["collection", "remove", "agent-cpo-2-project-project-1"]);
         cb(null, "removed", "");
         return;
       }
       if (args[0] === "collection" && args[1] === "add") {
-        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cpo-2"]);
+        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cpo-2-project-project-1"]);
         cb(null, "added", "");
         return;
       }
       cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
     });
 
-    await expect(refreshManagedAgentQmdCollection(agentId, "cpo-2")).resolves.toBe(true);
+    await expect(refreshManagedAgentProjectQmdCollection(agentId, "cpo-2", projectId)).resolves.toBe(true);
     expect(mockExecFile).toHaveBeenCalledTimes(3);
   });
 
-  it("creates the collection when refresh sees it is missing", async () => {
+  it("creates the project-scoped collection when it does not exist yet", async () => {
     const paperclipHome = await makeTempDir("paperclip-qmd-refresh-add-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     const agentId = "66666666-6666-4666-8666-666666666666";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
+    const projectId = "project-2";
+    const expectedAgentHome = resolveManagedAgentProjectMemoryDir(agentId, projectId);
 
     mockExecFile.mockImplementation((command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
       expect(command).toBe("qmd");
       if (args[0] === "collection" && args[1] === "show") {
-        cb(new Error("Collection not found: agent-cfo"), "", "Collection not found: agent-cfo");
+        cb(
+          new Error("Collection not found: agent-cfo-project-project-2"),
+          "",
+          "Collection not found: agent-cfo-project-project-2",
+        );
         return;
       }
       if (args[0] === "collection" && args[1] === "add") {
-        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cfo"]);
+        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cfo-project-project-2"]);
         cb(null, "added", "");
         return;
       }
       cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
     });
 
-    await expect(refreshManagedAgentQmdCollection(agentId, "cfo")).resolves.toBe(true);
+    await expect(initManagedAgentProjectQmdCollection(agentId, "cfo", projectId)).resolves.toBe(true);
     expect(mockExecFile).toHaveBeenCalledTimes(2);
   });
 
@@ -443,34 +355,29 @@ describe("refreshManagedAgentQmdCollection", () => {
     const paperclipHome = await makeTempDir("paperclip-qmd-refresh-repair-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     const agentId = "77777777-7777-4777-8777-777777777777";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
+    const projectId = "project-3";
+    const expectedAgentHome = resolveManagedAgentProjectMemoryDir(agentId, projectId);
 
     mockExecFile.mockImplementation((command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
       expect(command).toBe("qmd");
       if (args[0] === "collection" && args[1] === "show") {
-        cb(null, "Collection: agent-cmo\n  Path:     /tmp/other-agent-home\n", "");
+        cb(null, "Collection: agent-cmo-project-project-3\n  Path:     /tmp/other-agent-home\n", "");
         return;
       }
       if (args[0] === "collection" && args[1] === "remove") {
-        expect(args).toEqual(["collection", "remove", "agent-cmo"]);
+        expect(args).toEqual(["collection", "remove", "agent-cmo-project-project-3"]);
         cb(null, "removed", "");
         return;
       }
       if (args[0] === "collection" && args[1] === "add") {
-        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cmo"]);
+        expect(args).toEqual(["collection", "add", expectedAgentHome, "--name", "agent-cmo-project-project-3"]);
         cb(null, "added", "");
         return;
       }
       cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
     });
 
-    await expect(refreshManagedAgentQmdCollection(agentId, "cmo")).resolves.toBe(true);
+    await expect(refreshManagedAgentProjectQmdCollection(agentId, "cmo", projectId)).resolves.toBe(true);
     expect(mockExecFile).toHaveBeenCalledTimes(3);
   });
 
@@ -478,18 +385,13 @@ describe("refreshManagedAgentQmdCollection", () => {
     const paperclipHome = await makeTempDir("paperclip-qmd-refresh-failure-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     const agentId = "88888888-8888-4888-8888-888888888888";
-    const expectedAgentHome = path.join(
-      paperclipHome,
-      "instances",
-      "default",
-      "workspaces",
-      agentId,
-    );
+    const projectId = "project-4";
+    const expectedAgentHome = resolveManagedAgentProjectMemoryDir(agentId, projectId);
 
     mockExecFile.mockImplementation((command: string, args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
       expect(command).toBe("qmd");
       if (args[0] === "collection" && args[1] === "show") {
-        cb(null, `Collection: agent-ceo\n  Path:     ${expectedAgentHome}\n`, "");
+        cb(null, `Collection: agent-ceo-project-project-4\n  Path:     ${expectedAgentHome}\n`, "");
         return;
       }
       if (args[0] === "collection" && args[1] === "remove") {
@@ -499,7 +401,7 @@ describe("refreshManagedAgentQmdCollection", () => {
       cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
     });
 
-    await expect(refreshManagedAgentQmdCollection(agentId, "ceo")).resolves.toBe(false);
+    await expect(refreshManagedAgentProjectQmdCollection(agentId, "ceo", projectId)).resolves.toBe(false);
     expect(mockExecFile).toHaveBeenCalledTimes(2);
   });
 });
