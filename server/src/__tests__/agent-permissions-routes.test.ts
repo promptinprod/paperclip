@@ -36,6 +36,7 @@ const baseAgent = {
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
   create: vi.fn(),
+  update: vi.fn(),
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
@@ -140,6 +141,14 @@ describe("agent permission routes", () => {
     mockAgentService.getChainOfCommand.mockResolvedValue([]);
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: baseAgent });
     mockAgentService.create.mockResolvedValue(baseAgent);
+    mockAgentService.update.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
+      const created = await mockAgentService.create.mock.results.at(-1)?.value;
+      return {
+        ...(created ?? baseAgent),
+        id,
+        ...patch,
+      };
+    });
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
     mockAccessService.getMembership.mockResolvedValue({
       id: "membership-1",
