@@ -334,7 +334,14 @@ describe.sequential("agent permission routes", () => {
       agent: baseAgent,
       activated: false,
     });
-    mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.update.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
+      const created = await mockAgentService.create.mock.results.at(-1)?.value;
+      return {
+        ...(created ?? baseAgent),
+        id,
+        ...patch,
+      };
+    });
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.hasPermission.mockResolvedValue(false);
