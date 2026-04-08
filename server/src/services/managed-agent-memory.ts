@@ -44,6 +44,10 @@ export function buildManagedAgentCollectionName(slug: string): string {
   return `agent-${slug}`;
 }
 
+export function buildManagedAgentCompanyCollectionName(companySlug: string, agentSlug: string): string {
+  return `${companySlug}-${agentSlug}`;
+}
+
 export function buildManagedAgentProjectCollectionName(slug: string, projectId: string): string {
   return `agent-${slug}-project-${normalizePathSegment(projectId, "project id")}`;
 }
@@ -218,6 +222,13 @@ export async function initManagedAgentQmdCollection(agentId: string, slug: strin
   });
 }
 
+export async function initManagedAgentCompanyQmdCollection(agentId: string, companySlug: string, agentSlug: string): Promise<boolean> {
+  return initManagedAgentQmdCollectionTarget({
+    rootDir: resolveDefaultAgentWorkspaceDir(agentId),
+    collectionName: buildManagedAgentCompanyCollectionName(companySlug, agentSlug),
+  });
+}
+
 export async function initManagedAgentProjectQmdCollection(
   agentId: string,
   slug: string,
@@ -237,6 +248,13 @@ export async function refreshManagedAgentQmdCollection(agentId: string, slug: st
   return refreshManagedAgentQmdCollectionTarget({
     rootDir: resolveDefaultAgentWorkspaceDir(agentId),
     collectionName: buildManagedAgentCollectionName(slug),
+  });
+}
+
+export async function refreshManagedAgentCompanyQmdCollection(agentId: string, companySlug: string, agentSlug: string): Promise<boolean> {
+  return refreshManagedAgentQmdCollectionTarget({
+    rootDir: resolveDefaultAgentWorkspaceDir(agentId),
+    collectionName: buildManagedAgentCompanyCollectionName(companySlug, agentSlug),
   });
 }
 
