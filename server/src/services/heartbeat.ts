@@ -10,6 +10,7 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  companies,
   goals,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -59,8 +60,11 @@ import {
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import {
+  buildManagedAgentCompanyCollectionName,
   buildManagedAgentProjectCollectionName,
+  initManagedAgentCompanyQmdCollection,
   initManagedAgentProjectQmdCollection,
+  refreshManagedAgentCompanyQmdCollection,
   refreshManagedAgentProjectQmdCollection,
   resolveManagedAgentProjectMemoryDir,
   supportsManagedAgentMemoryAdapter,
@@ -851,9 +855,9 @@ async function readRunLogContent(handle: RunLogHandle): Promise<string> {
 async function listManagedDirectReportCollections(
   db: Db,
   managerId: string,
-  projectId: string | null,
+  companySlug: string | null,
 ): Promise<string[]> {
-  if (!projectId) return [];
+  if (!companySlug) return [];
 
   const rows = await db
     .select({
@@ -866,7 +870,7 @@ async function listManagedDirectReportCollections(
   return uniqueSorted(
     rows
       .filter((row) => supportsManagedAgentMemoryAdapter(row.adapterType))
-      .map((row) => buildManagedAgentProjectCollectionName(deriveAgentUrlKey(row.name), projectId)),
+      .map((row) => buildManagedAgentCompanyCollectionName(companySlug, deriveAgentUrlKey(row.name))),
   );
 }
 
@@ -3604,38 +3608,35 @@ export function heartbeatService(db: Db) {
         }
       }
       const managedMemoryProjectId = supportsManagedMemory ? resolvedProjectId : null;
-      const managedMemoryProjectRow =
-        supportsManagedMemory && managedMemoryProjectId
-          ? await db
-              .select({ name: projects.name })
-              .from(projects)
-              .where(and(eq(projects.id, managedMemoryProjectId), eq(projects.companyId, agent.companyId)))
-              .then((rows) => rows[0] ?? null)
-          : null;
-      const managedMemoryAgentHome =
-        supportsManagedMemory && managedMemoryProjectId
-          ? resolveManagedAgentProjectMemoryDir(agent.id, managedMemoryProjectId)
-          : null;
+      const managedMemoryCompanySlug = supportsManagedMemory
+        ? await db
+            .select({ name: companies.name })
+            .from(companies)
+            .where(eq(companies.id, agent.companyId))
+            .then((rows) => deriveAgentUrlKey(rows[0]?.name))
+        : null;
+      const managedMemoryAgentHome = supportsManagedMemory
+        ? resolveDefaultAgentWorkspaceDir(agent.id)
+        : null;
       const managedMemoryCollectionName =
-        managedMemorySlug && managedMemoryProjectId
-          ? buildManagedAgentProjectCollectionName(managedMemorySlug, managedMemoryProjectId)
+        managedMemorySlug && managedMemoryCompanySlug
+          ? buildManagedAgentCompanyCollectionName(managedMemoryCompanySlug, managedMemorySlug)
           : null;
       const managedMemoryExpectedChildCollections = supportsManagedMemory
-        ? await listManagedDirectReportCollections(db, agent.id, managedMemoryProjectId)
+        ? await listManagedDirectReportCollections(db, agent.id, managedMemoryCompanySlug)
         : [];
       context.paperclipWorkspace = {
         ...parseObject(context.paperclipWorkspace),
         projectId: managedMemoryProjectId,
-        projectName: managedMemoryProjectRow?.name ?? null,
         agentHome: managedMemoryAgentHome,
         memoryCollection: managedMemoryCollectionName,
         directReportMemoryCollections: managedMemoryExpectedChildCollections,
       };
-      if (supportsManagedMemory && managedMemoryProjectId && managedMemorySlug) {
-        const collectionEnsured = await initManagedAgentProjectQmdCollection(
+      if (supportsManagedMemory && managedMemorySlug && managedMemoryCompanySlug) {
+        const collectionEnsured = await initManagedAgentCompanyQmdCollection(
           agent.id,
+          managedMemoryCompanySlug,
           managedMemorySlug,
-          managedMemoryProjectId,
         );
         if (!collectionEnsured) {
           logger.warn(
@@ -3671,7 +3672,7 @@ export function heartbeatService(db: Db) {
                 issueTitle: issueContext.title,
                 issueDescription: issueContext.description ?? null,
                 goalTitle: goalRow?.title ?? null,
-                projectName: managedMemoryProjectRow?.name ?? null,
+                projectName: null,
                 ancestorTitles: ancestors.map((ancestor) => ancestor.title),
                 wakeCommentBody:
                   wakeComment && wakeComment.issueId === issueContext.id ? wakeComment.body ?? null : null,
@@ -4031,11 +4032,11 @@ export function heartbeatService(db: Db) {
         );
       }
 
-      if (outcome === "succeeded" && supportsManagedAgentMemoryAdapter(agent.adapterType) && managedMemoryProjectId && managedMemorySlug) {
-        const refreshed = await refreshManagedAgentProjectQmdCollection(
+      if (outcome === "succeeded" && supportsManagedAgentMemoryAdapter(agent.adapterType) && managedMemorySlug && managedMemoryCompanySlug) {
+        const refreshed = await refreshManagedAgentCompanyQmdCollection(
           agent.id,
+          managedMemoryCompanySlug,
           managedMemorySlug,
-          managedMemoryProjectId,
         );
         if (!refreshed) {
           logger.warn(
